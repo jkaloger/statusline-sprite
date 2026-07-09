@@ -43,7 +43,12 @@ pub fn main(init: std.process.Init) !void {
     var sprite_arr: [3][]const u8 = undefined;
     var have_sprite = false;
 
-    if (caps.kitty_capable and png_bytes != null and cfg.sprite.box_rows == 3) {
+    // tmux masks the host terminal's identity (TERM=tmux-256color, no
+    // KITTY_WINDOW_ID), so capability can't be sniffed through it. Attempt
+    // graphics anyway when inside tmux -- the escapes are passthrough-wrapped
+    // and a non-graphics host simply drops them (best-effort, matches proto).
+    const can_graphics = caps.kitty_capable or caps.tmux;
+    if (can_graphics and png_bytes != null and cfg.sprite.box_rows == 3) {
         if (tryGraphics(gpa, io, caps, image_id, png_bytes.?, cfg.sprite.box_rows, cfg.sprite.box_cols)) {
             if (kitty.placeholderGrid(gpa, image_id, cfg.sprite.box_rows, cfg.sprite.box_cols) catch null) |g| {
                 grid = g;

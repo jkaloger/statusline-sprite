@@ -33,11 +33,17 @@ pub fn assembleRows(
     return out.toOwnedSlice(allocator);
 }
 
+/// First non-blank line of `bytes` (trailing CR stripped). Leading blank lines
+/// are skipped so multi-line prompt commands (e.g. `starship prompt`, which
+/// leads with an empty line) still yield their content. Empty if all blank.
 fn firstLine(bytes: []const u8) []const u8 {
-    const nl = std.mem.indexOfScalar(u8, bytes, '\n') orelse bytes.len;
-    var line = bytes[0..nl];
-    if (line.len > 0 and line[line.len - 1] == '\r') line = line[0 .. line.len - 1];
-    return line;
+    var it = std.mem.splitScalar(u8, bytes, '\n');
+    while (it.next()) |raw| {
+        var line = raw;
+        if (line.len > 0 and line[line.len - 1] == '\r') line = line[0 .. line.len - 1];
+        if (line.len > 0) return line;
+    }
+    return bytes[0..0];
 }
 
 /// Run `sh -c "<cmd>"`, capture stdout, enforce a wall-clock `timeout_ms`.
