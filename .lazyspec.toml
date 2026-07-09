@@ -1,0 +1,66 @@
+[[types]]
+name = "spec"
+plural = "spec"
+dir = "docs/specs"
+prefix = "SPEC"
+icon = "■"
+numbering = "incremental"
+subdirectory = false
+store = "filesystem"
+singleton = false
+agents = []
+authorship = "generated"
+attributes = []
+
+[types.lifecycle]
+states = [
+    "draft",
+    "accepted",
+    "in-progress",
+    "complete",
+    "rejected",
+    "superseded",
+]
+
+[[types.lifecycle.edges]]
+from = "draft"
+to = "accepted"
+
+[[types.lifecycle.edges]]
+from = "accepted"
+to = "in-progress"
+
+[[types.lifecycle.edges]]
+from = "in-progress"
+to = "complete"
+
+[[types.lifecycle.edges]]
+from = "*"
+to = "superseded"
+
+[naming]
+pattern = "{type}-{n:03}-{title}.md"
+
+[templates]
+dir = ".lazyspec/templates"
+
+[[relationships]]
+name = "related-to"
+traversal = "related"
+
+[tui]
+ascii_diagrams = true
+
+[tui.statusbar]
+enabled = true
+
+[tui.multiline]
+max_expanded_height = 5
+
+[tui.graph]
+columns = [
+    "status",
+    "related",
+]
+sort = "path"
+
