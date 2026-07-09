@@ -1,5 +1,7 @@
 # statusline-sprite tasks
 
+prefix := env_var_or_default("PREFIX", env_var("HOME") / ".local")
+
 default:
     @just --list
 
@@ -30,6 +32,13 @@ integration:
 
 # Run all tests
 check: test integration
+
+# Install the release binary to {{prefix}}/bin (override with PREFIX=...)
+install:
+    zig build -Doptimize=ReleaseFast
+    mkdir -p {{prefix}}/bin
+    install -m 755 zig-out/bin/statusline-sprite {{prefix}}/bin/statusline-sprite
+    @echo "installed -> {{prefix}}/bin/statusline-sprite"
 
 # Format source
 fmt:

@@ -65,7 +65,7 @@ pub fn transmit(
         const more = end < b64.len;
 
         const control = if (first)
-            try std.fmt.allocPrint(allocator, "a=t,f=100,i={d},m={d}", .{ image_id, @intFromBool(more) })
+            try std.fmt.allocPrint(allocator, "a=t,f=100,i={d},q=2,m={d}", .{ image_id, @intFromBool(more) })
         else
             try std.fmt.allocPrint(allocator, "m={d}", .{@intFromBool(more)});
         defer allocator.free(control);
@@ -80,8 +80,10 @@ pub fn transmit(
 }
 
 /// Delete image `image_id` and its placements: `a=d,d=i,i=<id>`. No payload.
+/// `q=2` suppresses the terminal's OK/error ACK (which would otherwise leak
+/// onto the tty and corrupt the shell).
 pub fn delete(allocator: std.mem.Allocator, image_id: u32) ![]u8 {
-    return std.fmt.allocPrint(allocator, "\x1b_Ga=d,d=i,i={d}\x1b\\", .{image_id});
+    return std.fmt.allocPrint(allocator, "\x1b_Ga=d,d=i,i={d},q=2\x1b\\", .{image_id});
 }
 
 /// Unicode-placeholder virtual placement: `a=p,U=1,i=<id>,c=<cols>,r=<rows>`.
@@ -93,7 +95,7 @@ pub fn virtualPlacement(
 ) ![]u8 {
     return std.fmt.allocPrint(
         allocator,
-        "\x1b_Ga=p,U=1,i={d},c={d},r={d}\x1b\\",
+        "\x1b_Ga=p,U=1,i={d},c={d},r={d},q=2\x1b\\",
         .{ image_id, cols, rows },
     );
 }
