@@ -29,12 +29,23 @@ pub fn main(init: std.process.Init) !void {
 
     const tokens = tier.tokensFrom(sl);
     const tier_idx = tier.selectTier(tokens, cfg.sprite.scale_tokens, cfg.sprite.tiers);
-    const image_id: u32 = 1000 + tier_idx;
+    // Base 100 keeps ids <= 255 so they fit a 256-color palette index; the
+    // placeholder cell encodes the id via `38;5;<id>` (see kitty.placeholderGrid).
+    const image_id: u32 = 100 + tier_idx;
 
     const png_bytes = readFace(gpa, io, cfg, tier_idx);
     defer if (png_bytes) |b| gpa.free(b);
 
     const caps = detectCaps(environ);
+
+    var dbg: std.ArrayList(u8) = .empty;
+    defer dbg.deinit(gpa);
+    dbg.print(gpa, "tmux={} kitty_capable={} tmux_pane={s} png_len={?d} box_rows={d} box_cols={d}\n", .{
+        caps.tmux,       caps.kitty_capable,
+        caps.tmux_pane orelse "(null)",
+        if (png_bytes) |b| b.len else null,
+        cfg.sprite.box_rows, cfg.sprite.box_cols,
+    }) catch {};
 
     // Best-effort graphics. `grid` backs the sprite-row slices, so it must
     // outlive the assembleRows call below.
@@ -48,8 +59,9 @@ pub fn main(init: std.process.Init) !void {
     // graphics anyway when inside tmux -- the escapes are passthrough-wrapped
     // and a non-graphics host simply drops them (best-effort, matches proto).
     const can_graphics = caps.kitty_capable or caps.tmux;
+    dbg.print(gpa, "can_graphics={} image_id={d}\n", .{ can_graphics, image_id }) catch {};
     if (can_graphics and png_bytes != null and cfg.sprite.box_rows == 3) {
-        if (tryGraphics(gpa, io, caps, image_id, png_bytes.?, cfg.sprite.box_rows, cfg.sprite.box_cols)) {
+        if (tryGraphics(gpa, io, caps, image_id, png_bytes.?, cfg.sprite.box_rows, cfg.sprite.box_cols, &dbg)) {
             if (kitty.placeholderGrid(gpa, image_id, cfg.sprite.box_rows, cfg.sprite.box_cols) catch null) |g| {
                 grid = g;
                 var count: usize = 0;
@@ -61,6 +73,8 @@ pub fn main(init: std.process.Init) !void {
             }
         }
     }
+    dbg.print(gpa, "have_sprite={}\n", .{have_sprite}) catch {};
+    writeDebug(io, environ, dbg.items);
 
     const l1 = if (cfg.line1.command) |c| rows.runCommand(gpa, io, c, 1000) else try gpa.dupe(u8, "");
     defer gpa.free(l1);
@@ -105,12 +119,16 @@ fn readFace(gpa: std.mem.Allocator, io: Io, cfg: config.Config, tier_idx: u32) ?
 const Caps = struct {
     tmux: bool,
     kitty_capable: bool,
+    /// The `%N` pane this process belongs to (from $TMUX_PANE). Null outside
+    /// tmux. Used to target `tmux display -t` at the correct pane's tty.
+    tmux_pane: ?[]const u8,
 };
 
 fn detectCaps(environ: std.process.Environ) Caps {
     const term = environ.getPosix("TERM");
     const term_program = environ.getPosix("TERM_PROGRAM");
     const tmux_env = environ.getPosix("TMUX");
+    const tmux_pane = environ.getPosix("TMUX_PANE");
     const kitty_win = environ.getPosix("KITTY_WINDOW_ID");
 
     const is_tmux = (tmux_env != null and tmux_env.?.len > 0) or
@@ -127,7 +145,8 @@ fn detectCaps(environ: std.process.Environ) Caps {
         if (std.ascii.indexOfIgnoreCase(tp, "wezterm") != null) capable = true;
     }
 
-    return .{ .tmux = is_tmux, .kitty_capable = capable };
+    const pane = if (tmux_pane) |p| (if (p.len > 0) p else null) else null;
+    return .{ .tmux = is_tmux, .kitty_capable = capable, .tmux_pane = pane };
 }
 
 /// Open the graphics target and write delete/transmit/placement escapes.
@@ -140,13 +159,25 @@ fn tryGraphics(
     png: []const u8,
     box_rows: u32,
     box_cols: u32,
+    dbg: *std.ArrayList(u8),
 ) bool {
     var tty_path: []const u8 = "/dev/tty";
     var owned_path: ?[]u8 = null;
     defer if (owned_path) |p| gpa.free(p);
 
     if (caps.tmux) {
-        const out = rows.runCommand(gpa, io, "tmux display -p '#{pane_tty}'", 1000);
+        // Pin the query to THIS pane (-t $TMUX_PANE). Without it, `tmux display`
+        // resolves the session's *active* pane -- which, when we run as a
+        // Claude Code statusline subprocess (no client focus), is often a
+        // different pane, so the image lands on the wrong tty and never shows.
+        const cmd = if (caps.tmux_pane) |pane|
+            std.fmt.allocPrint(gpa, "tmux display -p -t '{s}' '#{{pane_tty}}'", .{pane}) catch return false
+        else
+            gpa.dupe(u8, "tmux display -p '#{pane_tty}'") catch return false;
+        defer gpa.free(cmd);
+
+        const out = rows.runCommand(gpa, io, cmd, 1000);
+        dbg.print(gpa, "tmux_query={s} -> tty={s}\n", .{ cmd, out }) catch {};
         if (out.len == 0) {
             gpa.free(out);
             return false;
@@ -155,11 +186,33 @@ fn tryGraphics(
         tty_path = out;
     }
 
-    const tty = std.Io.Dir.openFileAbsolute(io, tty_path, .{ .mode = .write_only }) catch return false;
+    const tty = std.Io.Dir.openFileAbsolute(io, tty_path, .{ .mode = .write_only }) catch |e| {
+        dbg.print(gpa, "open tty {s} failed: {}\n", .{ tty_path, e }) catch {};
+        return false;
+    };
     defer tty.close(io);
 
-    buildAndWrite(gpa, io, tty, caps.tmux, image_id, png, box_rows, box_cols) catch return false;
+    buildAndWrite(gpa, io, tty, caps.tmux, image_id, png, box_rows, box_cols) catch |e| {
+        dbg.print(gpa, "buildAndWrite failed: {}\n", .{e}) catch {};
+        return false;
+    };
+    dbg.print(gpa, "graphics written to {s}\n", .{tty_path}) catch {};
     return true;
+}
+
+/// Append `text` to $HOME/.sprite-debug.log, but only when the marker file
+/// $HOME/.sprite-debug exists. No-op on any error or when disabled.
+fn writeDebug(io: Io, environ: std.process.Environ, text: []const u8) void {
+    const home = environ.getPosix("HOME") orelse return;
+    var buf: [512]u8 = undefined;
+    const marker = std.fmt.bufPrint(&buf, "{s}/.sprite-debug", .{home}) catch return;
+    std.Io.Dir.cwd().access(io, marker, .{}) catch return;
+
+    var buf2: [512]u8 = undefined;
+    const path = std.fmt.bufPrint(&buf2, "{s}/.sprite-debug.log", .{home}) catch return;
+    const f = std.Io.Dir.cwd().createFile(io, path, .{ .truncate = true }) catch return;
+    defer f.close(io);
+    f.writeStreamingAll(io, text) catch {};
 }
 
 fn buildAndWrite(

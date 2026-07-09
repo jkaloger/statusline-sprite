@@ -101,9 +101,13 @@ pub fn virtualPlacement(
 }
 
 /// Build the printable placeholder-cell grid. Each cell is U+10EEEE followed by
-/// the row then column diacritic. The image id travels via a truecolor fg SGR
-/// set at the start of each row and reset (39) at its end. Rows are separated by
-/// a single '\n' with NO trailing newline.
+/// the row then column diacritic. The image id travels via a 256-color fg SGR
+/// (`38;5;<id>`) set at the start of each row and reset (`0m`) at its end. Rows
+/// are separated by a single '\n' with NO trailing newline.
+///
+/// 256-color (not truecolor) because Claude Code's statusline renderer does not
+/// preserve a `38;2;r;g;b` SGR intact, which corrupts the id kitty reads from
+/// the cell -- so `image_id` must be <= 255.
 pub fn placeholderGrid(
     allocator: std.mem.Allocator,
     image_id: u32,
@@ -120,11 +124,7 @@ pub fn placeholderGrid(
     while (r < rows) : (r += 1) {
         if (r > 0) try out.append(allocator, '\n');
 
-        const fg = try std.fmt.allocPrint(allocator, "\x1b[38;2;{d};{d};{d}m", .{
-            (image_id >> 16) & 0xFF,
-            (image_id >> 8) & 0xFF,
-            image_id & 0xFF,
-        });
+        const fg = try std.fmt.allocPrint(allocator, "\x1b[38;5;{d}m", .{image_id & 0xFF});
         defer allocator.free(fg);
         try out.appendSlice(allocator, fg);
 
@@ -135,7 +135,7 @@ pub fn placeholderGrid(
             try appendCodepoint(&out, allocator, rowcolumn_diacritics[c]);
         }
 
-        try out.appendSlice(allocator, "\x1b[39m");
+        try out.appendSlice(allocator, "\x1b[0m");
     }
 
     return out.toOwnedSlice(allocator);
@@ -239,7 +239,7 @@ test "virtualPlacement: contains a=p,U=1,i,c,r" {
 
 test "placeholderGrid: cell count, diacritics, fg SGR, separators" {
     const a = std.testing.allocator;
-    const id: u32 = 0x010203;
+    const id: u32 = 103;
     const out = try placeholderGrid(a, id, 3, 6);
     defer a.free(out);
 
@@ -250,9 +250,9 @@ test "placeholderGrid: cell count, diacritics, fg SGR, separators" {
     // 3 rows -> 2 separators, no trailing newline
     try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, out, "\n"));
 
-    // fg = id rgb (0x01,0x02,0x03), plus reset
-    try std.testing.expect(std.mem.indexOf(u8, out, "\x1b[38;2;1;2;3m") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "\x1b[39m") != null);
+    // fg = 256-color id, plus full reset
+    try std.testing.expect(std.mem.indexOf(u8, out, "\x1b[38;5;103m") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\x1b[0m") != null);
 
     // row0 col0 -> diacritics 0x0305, 0x0305
     const cell00 = try cellSlice(a, 0x0305, 0x0305);
