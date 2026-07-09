@@ -76,9 +76,14 @@ pub fn main(init: std.process.Init) !void {
 
     const l1 = if (cfg.line1.command) |c| rows.runCommand(gpa, io, c, 1000) else try gpa.dupe(u8, "");
     defer gpa.free(l1);
+    const l2 = if (cfg.line2.color) |c|
+        try std.fmt.allocPrint(gpa, "\x1b[38;5;{d}m{s}\x1b[0m", .{ c, sl.model_display_name })
+    else
+        try gpa.dupe(u8, sl.model_display_name);
+    defer gpa.free(l2);
     const l3 = if (cfg.line3.command) |c| rows.runCommand(gpa, io, c, 1000) else try gpa.dupe(u8, "");
     defer gpa.free(l3);
-    const text_lines: [rows.line_count][]const u8 = .{ l1, sl.model_display_name, l3 };
+    const text_lines: [rows.line_count][]const u8 = .{ l1, l2, l3 };
 
     const sprite_rows: ?[]const []const u8 = if (have_sprite) sprite_arr[0..] else null;
     const block = try rows.assembleRows(gpa, sprite_rows, text_lines, "  ");

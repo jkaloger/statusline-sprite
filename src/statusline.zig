@@ -23,11 +23,15 @@ const Model = struct {
     display_name: []const u8 = "unknown",
 };
 
-const Raw = struct {
-    model: Model = .{},
+const ContextWindow = struct {
     total_input_tokens: ?u64 = null,
     used_percentage: ?f64 = null,
     context_window_size: ?u64 = null,
+};
+
+const Raw = struct {
+    model: Model = .{},
+    context_window: ContextWindow = .{},
 };
 
 pub fn parse(allocator: std.mem.Allocator, json_bytes: []const u8) !ParsedStatusline {
@@ -41,9 +45,9 @@ pub fn parse(allocator: std.mem.Allocator, json_bytes: []const u8) !ParsedStatus
         .parsed = parsed,
         .value = .{
             .model_display_name = parsed.value.model.display_name,
-            .total_input_tokens = parsed.value.total_input_tokens,
-            .used_percentage = parsed.value.used_percentage,
-            .context_window_size = parsed.value.context_window_size,
+            .total_input_tokens = parsed.value.context_window.total_input_tokens,
+            .used_percentage = parsed.value.context_window.used_percentage,
+            .context_window_size = parsed.value.context_window.context_window_size,
         },
     };
 }
@@ -64,7 +68,40 @@ test "extracts nested model.display_name and ignores unrelated fields" {
     try std.testing.expectEqualStrings("Opus 4.8", result.value.model_display_name);
 }
 
-test "populates token optionals when present" {
+test "populates token optionals from nested context_window" {
+    const json =
+        \\{
+        \\  "model": { "display_name": "Sonnet" },
+        \\  "context_window": {
+        \\    "total_input_tokens": 12345,
+        \\    "total_output_tokens": 678,
+        \\    "used_percentage": 42.5,
+        \\    "context_window_size": 200000
+        \\  }
+        \\}
+    ;
+    const result = try parse(std.testing.allocator, json);
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(?u64, 12345), result.value.total_input_tokens);
+    try std.testing.expectEqual(@as(?f64, 42.5), result.value.used_percentage);
+    try std.testing.expectEqual(@as(?u64, 200000), result.value.context_window_size);
+}
+
+test "integer used_percentage parses into f64" {
+    const json =
+        \\{
+        \\  "model": { "display_name": "Sonnet" },
+        \\  "context_window": { "used_percentage": 8, "context_window_size": 200000 }
+        \\}
+    ;
+    const result = try parse(std.testing.allocator, json);
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(?f64, 8.0), result.value.used_percentage);
+}
+
+test "top-level token fields are ignored, not picked up" {
     const json =
         \\{
         \\  "model": { "display_name": "Sonnet" },
@@ -76,12 +113,12 @@ test "populates token optionals when present" {
     const result = try parse(std.testing.allocator, json);
     defer result.deinit();
 
-    try std.testing.expectEqual(@as(?u64, 12345), result.value.total_input_tokens);
-    try std.testing.expectEqual(@as(?f64, 42.5), result.value.used_percentage);
-    try std.testing.expectEqual(@as(?u64, 200000), result.value.context_window_size);
+    try std.testing.expectEqual(@as(?u64, null), result.value.total_input_tokens);
+    try std.testing.expectEqual(@as(?f64, null), result.value.used_percentage);
+    try std.testing.expectEqual(@as(?u64, null), result.value.context_window_size);
 }
 
-test "missing token fields yield null, not an error" {
+test "missing context_window yields null, not an error" {
     const json =
         \\{
         \\  "session_id": "xyz",

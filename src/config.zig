@@ -14,9 +14,15 @@ pub const Line = struct {
     command: ?[]const u8,
 };
 
+pub const Line2 = struct {
+    /// 256-color palette index for the model name. Null means unstyled.
+    color: ?u8,
+};
+
 pub const Config = struct {
     sprite: Sprite,
     line1: Line,
+    line2: Line2,
     line3: Line,
     /// Backing storage for any strings parsed from TOML. Null for the pure
     /// `defaults()` value, whose strings are program-lifetime literals.
@@ -42,6 +48,7 @@ pub fn defaults() Config {
             .faces = null,
         },
         .line1 = .{ .command = null },
+        .line2 = .{ .color = null },
         .line3 = .{ .command = null },
         .arena = null,
     };
@@ -137,6 +144,10 @@ fn applyKey(a: Allocator, cfg: *Config, table: []const u8, key: []const u8, rhs:
         if (std.mem.eql(u8, key, "command")) {
             if (try parseString(a, rhs)) |v| cfg.line1.command = v;
         }
+    } else if (std.mem.eql(u8, table, "line2")) {
+        if (std.mem.eql(u8, key, "color")) {
+            if (parseInt(u8, rhs)) |v| cfg.line2.color = v;
+        }
     } else if (std.mem.eql(u8, table, "line3")) {
         if (std.mem.eql(u8, key, "command")) {
             if (try parseString(a, rhs)) |v| cfg.line3.command = v;
@@ -207,6 +218,7 @@ test "defaults returns documented values" {
     try std.testing.expectEqual(@as(u32, 6), cfg.sprite.box_cols);
     try std.testing.expectEqual(@as(?[]const []const u8, null), cfg.sprite.faces);
     try std.testing.expectEqual(@as(?[]const u8, null), cfg.line1.command);
+    try std.testing.expectEqual(@as(?u8, null), cfg.line2.color);
     try std.testing.expectEqual(@as(?[]const u8, null), cfg.line3.command);
 }
 
@@ -231,6 +243,28 @@ test "loadFromToml merges partial overrides over defaults" {
     try std.testing.expectEqual(@as(u32, 6), cfg.sprite.box_cols);
     try std.testing.expectEqual(@as(?[]const []const u8, null), cfg.sprite.faces);
     try std.testing.expectEqual(@as(?[]const u8, null), cfg.line3.command);
+}
+
+test "loadFromToml parses line2 color" {
+    const toml =
+        \\[line2]
+        \\color = 213
+    ;
+    var cfg = try loadFromToml(std.testing.allocator, toml);
+    defer cfg.deinit();
+
+    try std.testing.expectEqual(@as(?u8, 213), cfg.line2.color);
+}
+
+test "loadFromToml ignores out-of-range line2 color" {
+    const toml =
+        \\[line2]
+        \\color = 999
+    ;
+    var cfg = try loadFromToml(std.testing.allocator, toml);
+    defer cfg.deinit();
+
+    try std.testing.expectEqual(@as(?u8, null), cfg.line2.color);
 }
 
 test "loadFromToml parses a faces array" {
