@@ -40,17 +40,17 @@ pub fn main(init: std.process.Init) !void {
 
     var dbg: std.ArrayList(u8) = .empty;
     defer dbg.deinit(gpa);
-    dbg.print(gpa, "tmux={} kitty_capable={} tmux_pane={s} png_len={?d} box_rows={d} box_cols={d}\n", .{
+    dbg.print(gpa, "tmux={} kitty_capable={} tmux_pane={s} png_len={?d} box_cols={d}\n", .{
         caps.tmux,                      caps.kitty_capable,
         caps.tmux_pane orelse "(null)", if (png_bytes) |b| b.len else null,
-        cfg.sprite.box_rows,            cfg.sprite.box_cols,
+        cfg.sprite.box_cols,
     }) catch {};
 
     // Best-effort graphics. `grid` backs the sprite-row slices, so it must
     // outlive the assembleRows call below.
     var grid: ?[]u8 = null;
     defer if (grid) |g| gpa.free(g);
-    var sprite_arr: [3][]const u8 = undefined;
+    var sprite_arr: [rows.line_count][]const u8 = undefined;
     var have_sprite = false;
 
     // tmux masks the host terminal's identity (TERM=tmux-256color, no
@@ -59,16 +59,16 @@ pub fn main(init: std.process.Init) !void {
     // and a non-graphics host simply drops them (best-effort, matches proto).
     const can_graphics = caps.kitty_capable or caps.tmux;
     dbg.print(gpa, "can_graphics={} image_id={d}\n", .{ can_graphics, image_id }) catch {};
-    if (can_graphics and png_bytes != null and cfg.sprite.box_rows == 3) {
-        if (tryGraphics(gpa, io, caps, image_id, png_bytes.?, cfg.sprite.box_rows, cfg.sprite.box_cols, &dbg)) {
-            if (kitty.placeholderGrid(gpa, image_id, cfg.sprite.box_rows, cfg.sprite.box_cols) catch null) |g| {
+    if (can_graphics and png_bytes != null) {
+        if (tryGraphics(gpa, io, caps, image_id, png_bytes.?, rows.line_count, cfg.sprite.box_cols, &dbg)) {
+            if (kitty.placeholderGrid(gpa, image_id, rows.line_count, cfg.sprite.box_cols) catch null) |g| {
                 grid = g;
                 var count: usize = 0;
                 var it = std.mem.splitScalar(u8, g, '\n');
                 while (it.next()) |line| : (count += 1) {
-                    if (count < 3) sprite_arr[count] = line;
+                    if (count < rows.line_count) sprite_arr[count] = line;
                 }
-                if (count == 3) have_sprite = true;
+                if (count == rows.line_count) have_sprite = true;
             }
         }
     }
@@ -78,7 +78,7 @@ pub fn main(init: std.process.Init) !void {
     defer gpa.free(l1);
     const l3 = if (cfg.line3.command) |c| rows.runCommand(gpa, io, c, 1000) else try gpa.dupe(u8, "");
     defer gpa.free(l3);
-    const text_lines: [3][]const u8 = .{ l1, sl.model_display_name, l3 };
+    const text_lines: [rows.line_count][]const u8 = .{ l1, sl.model_display_name, l3 };
 
     const sprite_rows: ?[]const []const u8 = if (have_sprite) sprite_arr[0..] else null;
     const block = try rows.assembleRows(gpa, sprite_rows, text_lines, "  ");

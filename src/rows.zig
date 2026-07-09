@@ -1,30 +1,34 @@
 const std = @import("std");
 const Io = std.Io;
 
+/// The statusline's fixed line count. The sprite grid, the text lines, and the
+/// assembled block all share this height; it is a layout invariant, not a knob.
+pub const line_count = 3;
+
 /// Assemble the three-line text block, optionally prefixed by sprite cells.
 ///
 /// With `sprite_rows == null` the block is just the text lines joined by '\n'.
 /// Otherwise each line is `sprite_rows[i] ++ gap ++ text_lines[i]`, and
-/// `sprite_rows` must have exactly three entries. No trailing newline.
+/// `sprite_rows` must have exactly `line_count` entries. No trailing newline.
 pub fn assembleRows(
     allocator: std.mem.Allocator,
     sprite_rows: ?[]const []const u8,
-    text_lines: [3][]const u8,
+    text_lines: [line_count][]const u8,
     gap: []const u8,
 ) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
 
     if (sprite_rows) |rows| {
-        if (rows.len != 3) return error.SpriteRowCountMismatch;
-        for (0..3) |i| {
+        if (rows.len != line_count) return error.SpriteRowCountMismatch;
+        for (0..line_count) |i| {
             if (i > 0) try out.append(allocator, '\n');
             try out.appendSlice(allocator, rows[i]);
             try out.appendSlice(allocator, gap);
             try out.appendSlice(allocator, text_lines[i]);
         }
     } else {
-        for (0..3) |i| {
+        for (0..line_count) |i| {
             if (i > 0) try out.append(allocator, '\n');
             try out.appendSlice(allocator, text_lines[i]);
         }

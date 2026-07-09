@@ -21,8 +21,14 @@ pub fn tokensFrom(sl: Statusline) u64 {
 
     if (sl.used_percentage) |pct| {
         if (sl.context_window_size) |window| {
+            // Both inputs come from untrusted stdin JSON; clamp to u64's range
+            // before @intFromFloat, which is illegal behavior when out of range.
+            // `!(tokens > 0)` (not `tokens <= 0`) so NaN also lands on the
+            // zero path instead of reaching the conversion.
             const tokens = pct / 100.0 * @as(f64, @floatFromInt(window));
-            if (tokens <= 0) return 0;
+            if (!(tokens > 0)) return 0;
+            const max_f: f64 = @floatFromInt(std.math.maxInt(u64));
+            if (tokens >= max_f) return std.math.maxInt(u64);
             return @intFromFloat(@round(tokens));
         }
     }
@@ -72,6 +78,26 @@ test "tokensFrom: falls back to percentage x window" {
         .context_window_size = 200000,
     };
     try std.testing.expectEqual(@as(u64, 100000), tokensFrom(sl));
+}
+
+test "tokensFrom: garbage percentage saturates instead of overflowing" {
+    const sl = Statusline{
+        .model_display_name = "x",
+        .total_input_tokens = null,
+        .used_percentage = 1e30,
+        .context_window_size = 200000,
+    };
+    try std.testing.expectEqual(std.math.maxInt(u64), tokensFrom(sl));
+}
+
+test "tokensFrom: NaN percentage yields 0" {
+    const sl = Statusline{
+        .model_display_name = "x",
+        .total_input_tokens = null,
+        .used_percentage = std.math.nan(f64),
+        .context_window_size = 200000,
+    };
+    try std.testing.expectEqual(@as(u64, 0), tokensFrom(sl));
 }
 
 test "tokensFrom: all null yields 0" {

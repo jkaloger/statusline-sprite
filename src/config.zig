@@ -5,7 +5,6 @@ pub const Sprite = struct {
     dir: []const u8,
     tiers: u32,
     scale_tokens: u64,
-    box_rows: u32,
     box_cols: u32,
     /// Explicit per-tier face paths. Null means "derive from dir" (see `deriveFaces`).
     faces: ?[]const []const u8,
@@ -39,7 +38,6 @@ pub fn defaults() Config {
             .dir = "./test-sprites",
             .tiers = 5,
             .scale_tokens = 200000,
-            .box_rows = 3,
             .box_cols = 6,
             .faces = null,
         },
@@ -130,8 +128,6 @@ fn applyKey(a: Allocator, cfg: *Config, table: []const u8, key: []const u8, rhs:
             if (parseInt(u32, rhs)) |v| cfg.sprite.tiers = v;
         } else if (std.mem.eql(u8, key, "scale_tokens")) {
             if (parseInt(u64, rhs)) |v| cfg.sprite.scale_tokens = v;
-        } else if (std.mem.eql(u8, key, "box_rows")) {
-            if (parseInt(u32, rhs)) |v| cfg.sprite.box_rows = v;
         } else if (std.mem.eql(u8, key, "box_cols")) {
             if (parseInt(u32, rhs)) |v| cfg.sprite.box_cols = v;
         } else if (std.mem.eql(u8, key, "faces")) {
@@ -208,7 +204,6 @@ test "defaults returns documented values" {
     try std.testing.expectEqualStrings("./test-sprites", cfg.sprite.dir);
     try std.testing.expectEqual(@as(u32, 5), cfg.sprite.tiers);
     try std.testing.expectEqual(@as(u64, 200000), cfg.sprite.scale_tokens);
-    try std.testing.expectEqual(@as(u32, 3), cfg.sprite.box_rows);
     try std.testing.expectEqual(@as(u32, 6), cfg.sprite.box_cols);
     try std.testing.expectEqual(@as(?[]const []const u8, null), cfg.sprite.faces);
     try std.testing.expectEqual(@as(?[]const u8, null), cfg.line1.command);
@@ -233,7 +228,6 @@ test "loadFromToml merges partial overrides over defaults" {
 
     // Untouched fields keep their defaults.
     try std.testing.expectEqual(@as(u64, 200000), cfg.sprite.scale_tokens);
-    try std.testing.expectEqual(@as(u32, 3), cfg.sprite.box_rows);
     try std.testing.expectEqual(@as(u32, 6), cfg.sprite.box_cols);
     try std.testing.expectEqual(@as(?[]const []const u8, null), cfg.sprite.faces);
     try std.testing.expectEqual(@as(?[]const u8, null), cfg.line3.command);
@@ -262,7 +256,6 @@ test "loadFromToml on empty/whitespace input equals defaults" {
     try std.testing.expectEqualStrings(d.sprite.dir, cfg.sprite.dir);
     try std.testing.expectEqual(d.sprite.tiers, cfg.sprite.tiers);
     try std.testing.expectEqual(d.sprite.scale_tokens, cfg.sprite.scale_tokens);
-    try std.testing.expectEqual(d.sprite.box_rows, cfg.sprite.box_rows);
     try std.testing.expectEqual(d.sprite.box_cols, cfg.sprite.box_cols);
     try std.testing.expectEqual(@as(?[]const []const u8, null), cfg.sprite.faces);
     try std.testing.expectEqual(@as(?[]const u8, null), cfg.line1.command);
@@ -322,7 +315,6 @@ test "load returns defaults when config file is missing" {
     try std.testing.expectEqualStrings(d.sprite.dir, cfg.sprite.dir);
     try std.testing.expectEqual(d.sprite.tiers, cfg.sprite.tiers);
     try std.testing.expectEqual(d.sprite.scale_tokens, cfg.sprite.scale_tokens);
-    try std.testing.expectEqual(d.sprite.box_rows, cfg.sprite.box_rows);
     try std.testing.expectEqual(d.sprite.box_cols, cfg.sprite.box_cols);
     try std.testing.expectEqual(@as(?[]const []const u8, null), cfg.sprite.faces);
     try std.testing.expectEqual(@as(?[]const u8, null), cfg.line1.command);
