@@ -1,0 +1,14 @@
+# statusline-sprite config
+# install: mkdir -p ~/.config/statusline-sprite && cp config.example.toml ~/.config/statusline-sprite/config.toml
+[sprite]
+dir = "/Users/jkaloger/thezone/statusline-sprite/test-sprites"
+tiers = 5
+scale_tokens = 200000
+box_rows = 3
+box_cols = 6
+
+[line1]
+command = "starship prompt"
+
+[line3]
+command = "date '+%H:%M'"

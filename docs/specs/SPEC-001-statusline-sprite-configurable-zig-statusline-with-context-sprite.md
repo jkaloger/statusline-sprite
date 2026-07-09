@@ -1,7 +1,7 @@
 ---
 title: "statusline-sprite: configurable Zig statusline with context sprite"
 type: spec
-status: accepted
+status: complete
 author: "unknown"
 date: 2026-07-09
 tags: []
@@ -79,13 +79,78 @@ Fields (draft):
   text rows without a sprite.
 - No git, cache, or dev-environment probes on the text rows.
 
-## Open questions
+## Resolved decisions (was: open questions)
 
-- Target Zig version / toolchain.
-- Default tier count and token scale.
-- Degradation contract when the terminal lacks kitty graphics support.
-- Whether L1/L3 commands receive the stdin JSON or run bare.
-- Timeout and error handling for the configured L1/L3 subprocess commands.
+- **Target toolchain:** Zig 0.16.0 (the installed toolchain). `zig build` builds;
+  `zig build test` runs the unit suite.
+- **Default tier count & token scale:** `sprite.tiers = 5` (matches the five
+  bundled test faces `face0..face4`), `sprite.scale_tokens = 200000`. Tier index
+  = floor(tokens / scale_tokens * tiers), clamped to `[0, tiers-1]`.
+- **Default sprite dir:** `./test-sprites` (bundled faces `face{0..4}.png`), so
+  the binary runs with no config. Overridable via `sprite.dir` / `sprite.faces`.
+- **Degradation contract:** if the terminal is not kitty-capable or no target tty
+  can be opened, skip graphics entirely and print the three text rows with no
+  sprite prefix. Graphics failures are always non-fatal.
+- **L1/L3 subprocess contract:** commands run bare via `sh -c "<command>"` (no
+  stdin JSON piped in) with a 1s wall-clock timeout. On timeout, non-zero exit,
+  or empty stdout, the row renders empty. Only the first line of stdout is used.
+- **Default box geometry:** `sprite.box_rows = 3`, `sprite.box_cols = 6`.
+
+## Task breakdown
+
+Each task is TDD (failing test first) and dispatched to a subagent. Zig unit
+tests live in `test` blocks; `zig build test` runs them. Pure logic
+(config/JSON/tier/escape building/row assembly) is unit-tested; end-to-end
+behaviour is covered by an integration test that runs the built binary.
+
+- **T1 — Test harness & module skeleton.** Wire `build.zig` so `zig build test`
+  runs unit tests across the source modules. Create module files
+  (`config.zig`, `statusline.zig`, `tier.zig`, `kitty.zig`, `rows.zig`) with
+  stubs and one trivial passing test each, imported from `main.zig`'s test refs.
+  AC: `zig build` and `zig build test` both succeed.
+
+- **T2 — Statusline JSON parsing (`statusline.zig`).** Parse the stdin JSON into a
+  struct exposing `model_display_name`, optional `total_input_tokens`, optional
+  `used_percentage`, optional `context_window_size`. Tolerant of missing/extra
+  fields. AC: sample Claude JSON parses; model display name extracted; missing
+  token fields yield nulls, not errors.
+
+- **T3 — Config model, TOML parse & defaults (`config.zig`).** Built-in defaults
+  (per Resolved decisions). Load `$XDG_CONFIG_HOME/statusline-sprite/config.toml`
+  else `~/.config/...`. Parse the draft fields. Missing file → defaults; partial
+  file → overrides merged over defaults. AC: no file → defaults; a file
+  overriding `sprite.dir`/`sprite.tiers`/`line1.command` merges correctly;
+  `$XDG_CONFIG_HOME` honoured.
+
+- **T4 — Tier selection (`tier.zig`).** `selectTier(tokens, scale_tokens, tiers)`
+  and the fallback `tokensFrom(statusline)` = `total_input_tokens` else
+  `used_percentage/100 * context_window_size`. Clamp to `[0, tiers-1]`. AC: 0
+  tokens → tier 0; ≥ scale_tokens → top tier; boundary crossing moves the tier;
+  fallback path computes from percentage when tokens absent.
+
+- **T5 — Kitty graphics escapes (`kitty.zig`).** Pure string builders: base64
+  chunked PNG transmit (`a=t`) under a given image id, delete prior image+
+  placements for an id (`a=d`), virtual placement (`a=p`, unicode placeholder),
+  and the `box_rows × box_cols` U+10EEEE placeholder grid with row/col
+  diacritics. tmux passthrough wrapping toggled by an `is_tmux` flag. AC: escapes
+  contain the documented control keys; chunking splits large payloads; tmux flag
+  wraps with `\ePtmux;` passthrough and doubles `\e`; placeholder grid has the
+  right cell count and diacritics.
+
+- **T6 — Text row assembly (`rows.zig`).** Run L1/L3 via `sh -c` with 1s timeout
+  (empty on failure/timeout/empty), take L2 = model display name, assemble three
+  rows. When a sprite renders, each row is prefixed with its placeholder cell
+  columns; when not, rows print bare. AC: given fake command outputs, three rows
+  assemble in order; failing/timing-out command → empty segment; sprite vs no
+  sprite prefixing correct.
+
+- **T7 — Main wiring, TTY target & degradation (`main.zig`).** Read stdin JSON,
+  load config, pick tier, resolve target tty (tmux `pane_tty` else `/dev/tty`),
+  best-effort transmit + placement to the tty, print exactly three rows to
+  stdout. All graphics failures non-fatal. AC (integration, runs the built
+  binary): given sample stdin JSON prints exactly three lines to stdout; runs
+  with no config file; still prints three rows when the graphics target can't be
+  opened; `sprite.dir` override is respected.
 
 ## Acceptance criteria
 
