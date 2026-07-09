@@ -74,7 +74,6 @@ pub fn main(init: std.process.Init) !void {
         }
     }
     dbg.print(gpa, "have_sprite={}\n", .{have_sprite}) catch {};
-    writeDebug(io, environ, dbg.items);
 
     const l1 = if (cfg.line1.command) |c| rows.runCommand(gpa, io, c, 1000) else try gpa.dupe(u8, "");
     defer gpa.free(l1);
@@ -198,21 +197,6 @@ fn tryGraphics(
     };
     dbg.print(gpa, "graphics written to {s}\n", .{tty_path}) catch {};
     return true;
-}
-
-/// Append `text` to $HOME/.sprite-debug.log, but only when the marker file
-/// $HOME/.sprite-debug exists. No-op on any error or when disabled.
-fn writeDebug(io: Io, environ: std.process.Environ, text: []const u8) void {
-    const home = environ.getPosix("HOME") orelse return;
-    var buf: [512]u8 = undefined;
-    const marker = std.fmt.bufPrint(&buf, "{s}/.sprite-debug", .{home}) catch return;
-    std.Io.Dir.cwd().access(io, marker, .{}) catch return;
-
-    var buf2: [512]u8 = undefined;
-    const path = std.fmt.bufPrint(&buf2, "{s}/.sprite-debug.log", .{home}) catch return;
-    const f = std.Io.Dir.cwd().createFile(io, path, .{ .truncate = true }) catch return;
-    defer f.close(io);
-    f.writeStreamingAll(io, text) catch {};
 }
 
 fn buildAndWrite(
