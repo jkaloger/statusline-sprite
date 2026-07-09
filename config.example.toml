@@ -2,7 +2,6 @@
 dir = "/path/to/test/sprites"
 tiers = 5
 scale_tokens = 200000
-box_rows = 3
 box_cols = 6
 
 [line1]
