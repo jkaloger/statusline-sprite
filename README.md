@@ -50,3 +50,7 @@ Then set it as your Claude Code statusline command in `~/.claude/settings.json`:
 ```json
 { "statusLine": { "type": "command", "command": "statusline-sprite" } }
 ```
+
+---
+
+Doom guy sprite © id Software, shown for demo purposes only — not covered by this project's MIT license.
