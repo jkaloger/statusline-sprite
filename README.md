@@ -6,6 +6,8 @@
     A Claude Code statusline that renders a sprite next to your status text using the kitty graphics protocol. The sprite changes as context window usage grows.
 </p>
 
+<img alt="doomguy" src="https://github.com/user-attachments/assets/14738443-7e6a-4ea9-93e8-3805eeaceb2c" />
+
 ## Build
 
 ```sh
