@@ -98,7 +98,8 @@ test "missing token fields yield null, not an error" {
 }
 
 test "absent model uses default display name" {
-    const json = \\{ "session_id": "no-model" }
+    const json =
+        \\{ "session_id": "no-model" }
     ;
     const result = try parse(std.testing.allocator, json);
     defer result.deinit();

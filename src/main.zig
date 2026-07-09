@@ -41,10 +41,9 @@ pub fn main(init: std.process.Init) !void {
     var dbg: std.ArrayList(u8) = .empty;
     defer dbg.deinit(gpa);
     dbg.print(gpa, "tmux={} kitty_capable={} tmux_pane={s} png_len={?d} box_rows={d} box_cols={d}\n", .{
-        caps.tmux,       caps.kitty_capable,
-        caps.tmux_pane orelse "(null)",
-        if (png_bytes) |b| b.len else null,
-        cfg.sprite.box_rows, cfg.sprite.box_cols,
+        caps.tmux,                      caps.kitty_capable,
+        caps.tmux_pane orelse "(null)", if (png_bytes) |b| b.len else null,
+        cfg.sprite.box_rows,            cfg.sprite.box_cols,
     }) catch {};
 
     // Best-effort graphics. `grid` backs the sprite-row slices, so it must
