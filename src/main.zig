@@ -409,6 +409,7 @@ test {
     _ = @import("frames.zig");
     _ = @import("rows.zig");
     _ = @import("state.zig");
+    _ = @import("anim.zig");
 }
 
 test "gapMs: fps 0 means static and yields 0" {
