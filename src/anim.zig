@@ -15,6 +15,11 @@ pub const Manifest = struct {
     /// frequency. T4/T6 populate it from config; a manifest written without the
     /// field parses back at `default_max_fps` for forward/backward compat.
     max_fps: u32,
+    /// Heartbeat staleness the daemon tolerates before exiting, in milliseconds
+    /// (SPEC-007 config, default 5000). The statusline writes it from
+    /// `sprite.daemon_ttl_ms`; a manifest without the field parses back at
+    /// `default_daemon_ttl_ms` for forward/backward compat.
+    daemon_ttl_ms: u32,
     tmux: bool,
     tty_path: []const u8,
     frames: []const []const u8,
@@ -23,6 +28,9 @@ pub const Manifest = struct {
 
 /// Applied when a manifest omits `max_fps` (older writer, or a hand-edited file).
 pub const default_max_fps: u32 = 30;
+
+/// Applied when a manifest omits `daemon_ttl_ms`.
+pub const default_daemon_ttl_ms: u32 = 5000;
 
 /// A parsed manifest whose strings live in an arena. Caller must `deinit`.
 pub const Parsed = struct {
@@ -72,11 +80,32 @@ pub fn daemonLockPath(allocator: Allocator, xdg_state_home: ?[]const u8, home: ?
 /// the daemon re-computing the key. Errors if the path is not an `anim-` file.
 /// Caller owns the result.
 pub fn daemonLockPathFromManifest(allocator: Allocator, manifest_path: []const u8) ![]u8 {
+    return siblingFromManifest(allocator, manifest_path, "daemon", ".lock");
+}
+
+/// Re-derive the heartbeat path (`anim-<x>` → `heartbeat-<x>`) from a manifest
+/// path, so the daemon can find the liveness file it was never handed on argv.
+/// Byte-identical to `heartbeatPath` for the same key. Caller owns the result.
+pub fn heartbeatPathFromManifest(allocator: Allocator, manifest_path: []const u8) ![]u8 {
+    return siblingFromManifest(allocator, manifest_path, "heartbeat", "");
+}
+
+/// Re-derive the state path (`anim-<x>` → `state-<x>`) from a manifest path.
+/// This is the file the statusline flocks around its transmit; the daemon takes
+/// the SAME lock around each tty write so the two never interleave. Byte-identical
+/// to `state.resolveStatePath` for the same key. Caller owns the result.
+pub fn statePathFromManifest(allocator: Allocator, manifest_path: []const u8) ![]u8 {
+    return siblingFromManifest(allocator, manifest_path, "state", "");
+}
+
+/// Swap an `anim-<key>` manifest basename for `<prefix>-<key><suffix>`, keeping
+/// the directory. Errors if the path is not an `anim-` file. Caller owns it.
+fn siblingFromManifest(allocator: Allocator, manifest_path: []const u8, comptime prefix: []const u8, comptime suffix: []const u8) ![]u8 {
     const dir = std.fs.path.dirname(manifest_path) orelse return error.BadManifestPath;
     const base = std.fs.path.basename(manifest_path);
     if (!std.mem.startsWith(u8, base, "anim-")) return error.BadManifestPath;
-    const suffix = base["anim-".len..];
-    return std.fmt.allocPrint(allocator, "{s}/daemon-{s}.lock", .{ dir, suffix });
+    const key = base["anim-".len..];
+    return std.fmt.allocPrint(allocator, "{s}/" ++ prefix ++ "-{s}" ++ suffix, .{ dir, key });
 }
 
 fn statePathNamed(allocator: Allocator, xdg_state_home: ?[]const u8, home: ?[]const u8, comptime prefix: []const u8, key: u64) ![]u8 {
@@ -105,8 +134,8 @@ pub fn serialize(allocator: Allocator, m: Manifest) ![]u8 {
 
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
-    try out.print(allocator, "image_id = {d}\ngap_ms = {d}\nmax_fps = {d}\ntmux = {d}\ntty = {s}\nframe_sig = {x}\n", .{
-        m.image_id, m.gap_ms, m.max_fps, @intFromBool(m.tmux), m.tty_path, m.frame_sig,
+    try out.print(allocator, "image_id = {d}\ngap_ms = {d}\nmax_fps = {d}\ndaemon_ttl_ms = {d}\ntmux = {d}\ntty = {s}\nframe_sig = {x}\n", .{
+        m.image_id, m.gap_ms, m.max_fps, m.daemon_ttl_ms, @intFromBool(m.tmux), m.tty_path, m.frame_sig,
     });
     for (m.frames) |f| try out.print(allocator, "frame = {s}\n", .{f});
     return out.toOwnedSlice(allocator);
@@ -119,6 +148,7 @@ pub fn parse(allocator: Allocator, bytes: []const u8) Allocator.Error!?Parsed {
     var image_id: ?u32 = null;
     var gap_ms: ?u32 = null;
     var max_fps: ?u32 = null;
+    var daemon_ttl_ms: ?u32 = null;
     var tmux: ?bool = null;
     var frame_sig: ?u64 = null;
     var tty_path: ?[]const u8 = null;
@@ -140,6 +170,8 @@ pub fn parse(allocator: Allocator, bytes: []const u8) Allocator.Error!?Parsed {
             gap_ms = std.fmt.parseInt(u32, rhs, 10) catch return null;
         } else if (std.mem.eql(u8, key, "max_fps")) {
             max_fps = std.fmt.parseInt(u32, rhs, 10) catch return null;
+        } else if (std.mem.eql(u8, key, "daemon_ttl_ms")) {
+            daemon_ttl_ms = std.fmt.parseInt(u32, rhs, 10) catch return null;
         } else if (std.mem.eql(u8, key, "tmux")) {
             if (std.mem.eql(u8, rhs, "1")) {
                 tmux = true;
@@ -180,6 +212,7 @@ pub fn parse(allocator: Allocator, bytes: []const u8) Allocator.Error!?Parsed {
             .image_id = id,
             .gap_ms = gap,
             .max_fps = max_fps orelse default_max_fps,
+            .daemon_ttl_ms = daemon_ttl_ms orelse default_daemon_ttl_ms,
             .tmux = tm,
             .tty_path = tty_dup,
             .frames = frame_dup,
@@ -304,6 +337,7 @@ fn sampleManifest() Manifest {
         .image_id = 103,
         .gap_ms = 125,
         .max_fps = 24,
+        .daemon_ttl_ms = 7000,
         .tmux = true,
         .tty_path = test_tty,
         .frames = &.{ "/abs/face1/0.png", "/abs/face1/1.png", "/abs/face1/2.png" },
@@ -315,6 +349,7 @@ fn expectManifestEqual(expected: Manifest, actual: Manifest) !void {
     try std.testing.expectEqual(expected.image_id, actual.image_id);
     try std.testing.expectEqual(expected.gap_ms, actual.gap_ms);
     try std.testing.expectEqual(expected.max_fps, actual.max_fps);
+    try std.testing.expectEqual(expected.daemon_ttl_ms, actual.daemon_ttl_ms);
     try std.testing.expectEqual(expected.tmux, actual.tmux);
     try std.testing.expectEqual(expected.frame_sig, actual.frame_sig);
     try std.testing.expectEqualStrings(expected.tty_path, actual.tty_path);
@@ -352,6 +387,20 @@ test "parse defaults max_fps when the field is absent (backward compat)" {
     var parsed = (try parse(a, "image_id = 103\ngap_ms = 125\ntmux = 0\ntty = /dev/tty\nframe_sig = ff\nframe = /a/0.png\n")).?;
     defer parsed.deinit();
     try std.testing.expectEqual(default_max_fps, parsed.value.max_fps);
+}
+
+test "parse defaults daemon_ttl_ms when the field is absent (backward compat)" {
+    const a = std.testing.allocator;
+    var parsed = (try parse(a, "image_id = 103\ngap_ms = 125\nmax_fps = 30\ntmux = 0\ntty = /dev/tty\nframe_sig = ff\nframe = /a/0.png\n")).?;
+    defer parsed.deinit();
+    try std.testing.expectEqual(default_daemon_ttl_ms, parsed.value.daemon_ttl_ms);
+}
+
+test "parse reads an explicit daemon_ttl_ms" {
+    const a = std.testing.allocator;
+    var parsed = (try parse(a, "image_id = 103\ngap_ms = 125\ndaemon_ttl_ms = 500\ntmux = 0\ntty = /dev/tty\nframe_sig = ff\nframe = /a/0.png\n")).?;
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(u32, 500), parsed.value.daemon_ttl_ms);
 }
 
 test "parse rejects non-absolute tty and frame paths" {
@@ -432,6 +481,35 @@ test "daemonLockPathFromManifest rejects a non-anim path" {
     try std.testing.expectError(error.BadManifestPath, daemonLockPathFromManifest(a, "anim-abc"));
 }
 
+test "heartbeatPathFromManifest agrees byte-for-byte with heartbeatPath" {
+    const a = std.testing.allocator;
+    const mp = try manifestPath(a, "/xdg-state", "/home/me", 0xabc);
+    defer a.free(mp);
+
+    const from_manifest = try heartbeatPathFromManifest(a, mp);
+    defer a.free(from_manifest);
+    const from_key = try heartbeatPath(a, "/xdg-state", "/home/me", 0xabc);
+    defer a.free(from_key);
+
+    try std.testing.expectEqualStrings(from_key, from_manifest);
+}
+
+test "statePathFromManifest sits alongside anim-<key> as state-<key>" {
+    const a = std.testing.allocator;
+    const mp = try manifestPath(a, "/xdg-state", "/home/me", 0xabc);
+    defer a.free(mp);
+
+    const sp = try statePathFromManifest(a, mp);
+    defer a.free(sp);
+    try std.testing.expectEqualStrings("/xdg-state/statusline-sprite/state-0000000000000abc", sp);
+}
+
+test "heartbeatPathFromManifest and statePathFromManifest reject a non-anim path" {
+    const a = std.testing.allocator;
+    try std.testing.expectError(error.BadManifestPath, heartbeatPathFromManifest(a, "/tmp/state-abc"));
+    try std.testing.expectError(error.BadManifestPath, statePathFromManifest(a, "/tmp/daemon-abc.lock"));
+}
+
 test "Locked: write then read round-trips through the state dir" {
     const a = std.testing.allocator;
     const io = std.testing.io;
@@ -451,6 +529,7 @@ test "Locked: write then read round-trips through the state dir" {
         .image_id = 104,
         .gap_ms = 63,
         .max_fps = 30,
+        .daemon_ttl_ms = 2500,
         .tmux = false,
         .tty_path = abs_tty,
         .frames = &.{abs_frames},

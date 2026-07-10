@@ -19,6 +19,7 @@ pub fn main(init: std.process.Init) !void {
     switch (daemon.classify(collectArgv(init.arena.allocator(), init.minimal.args))) {
         .animate => |manifest_path| return daemon.run(gpa, io, manifest_path),
         .ensure => |manifest_path| return ensureDaemonMain(gpa, io, manifest_path),
+        .lock_write => |lw| return daemon.lockWriteMain(gpa, io, lw.manifest, lw.count),
         .normal => {},
     }
 
@@ -80,7 +81,7 @@ pub fn main(init: std.process.Init) !void {
         };
         const animated = tierAnimated(loaded.?.bytes.len, fps, cfg.sprite.animate);
         dbg.print(gpa, "animated={} max_fps={d}\n", .{ animated, cfg.sprite.max_fps }) catch {};
-        if (tryGraphics(gpa, io, caps, env_paths, tier_idx, image_id, fps, gap_ms, cfg.sprite.max_fps, animated, loaded.?, rows.line_count, cfg.sprite.box_cols, &dbg)) {
+        if (tryGraphics(gpa, io, caps, env_paths, tier_idx, image_id, fps, gap_ms, cfg.sprite.max_fps, cfg.sprite.daemon_ttl_ms, animated, loaded.?, rows.line_count, cfg.sprite.box_cols, &dbg)) {
             if (kitty.placeholderGrid(gpa, image_id, rows.line_count, cfg.sprite.box_cols) catch null) |g| {
                 grid = g;
                 var count: usize = 0;
@@ -304,6 +305,7 @@ fn tryGraphics(
     fps: u32,
     gap_ms: u32,
     max_fps: u32,
+    daemon_ttl_ms: u32,
     animated: bool,
     loaded: LoadedFrames,
     box_rows: u32,
@@ -398,7 +400,7 @@ fn tryGraphics(
     // daemon can't clobber our frame-0 bytes before they land. Static tiers do
     // none of this. All best-effort: a failure never downgrades a placed sprite.
     if (animated) {
-        animatedUpkeep(gpa, io, env_paths, key, image_id, gap_ms, max_fps, caps.tmux, tty_path, loaded, dbg);
+        animatedUpkeep(gpa, io, env_paths, key, image_id, gap_ms, max_fps, daemon_ttl_ms, caps.tmux, tty_path, loaded, dbg);
     }
     return true;
 }
@@ -415,6 +417,7 @@ fn animatedUpkeep(
     image_id: u32,
     gap_ms: u32,
     max_fps: u32,
+    daemon_ttl_ms: u32,
     tmux: bool,
     tty_path: []const u8,
     loaded: LoadedFrames,
@@ -440,6 +443,7 @@ fn animatedUpkeep(
         .image_id = image_id,
         .gap_ms = gap_ms,
         .max_fps = max_fps,
+        .daemon_ttl_ms = daemon_ttl_ms,
         .tmux = tmux,
         .tty_path = abs_tty,
         .frames = loaded.paths,
