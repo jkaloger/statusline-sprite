@@ -1,7 +1,7 @@
 ---
 title: animated sprite tiers via kitty animation protocol
 type: spec
-status: draft
+status: superseded
 author: Jack Kaloger
 date: 2026-07-10
 tags: []
@@ -12,6 +12,13 @@ related:
 <!-- intent: spec for per-tier animated sprites driven by the kitty graphics animation protocol, terminal-side looping, no resident process -->
 
 # Animated sprite tiers via kitty animation protocol
+
+> **Superseded by SPEC-007.** The terminal-side playback model below
+> (`a=f`/`a=a`) does not work on Ghostty, which does not implement the kitty
+> animation protocol. SPEC-007 keeps this spec's frame model, config, resolver,
+> and state file, and replaces the animation delivery with a background daemon
+> that re-transmits frames via `a=t`. T1–T5 here (config, escape builders,
+> `frames.zig`, `state.zig`) are landed and reused.
 
 Extends SPEC-001. A tier can be a directory of PNG frames instead of a single
 PNG. Frames upload once via kitty animation escapes (`a=f`), the terminal loops

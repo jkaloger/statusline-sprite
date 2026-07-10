@@ -4,7 +4,10 @@ const statusline = @import("statusline.zig");
 const tier = @import("tier.zig");
 const kitty = @import("kitty.zig");
 const rows = @import("rows.zig");
-const cache = @import("cache.zig");
+const frames = @import("frames.zig");
+const state = @import("state.zig");
+const anim = @import("anim.zig");
+const daemon = @import("daemon.zig");
 
 const Io = std.Io;
 
@@ -12,6 +15,13 @@ pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
     const io = init.io;
     const environ = init.minimal.environ;
+
+    switch (daemon.classify(collectArgv(init.arena.allocator(), init.minimal.args))) {
+        .animate => |manifest_path| return daemon.run(gpa, io, manifest_path),
+        .ensure => |manifest_path| return ensureDaemonMain(gpa, io, manifest_path),
+        .lock_write => |lw| return daemon.lockWriteMain(gpa, io, lw.manifest, lw.count),
+        .normal => {},
+    }
 
     const stdin_bytes = readStdin(gpa, io) catch &.{};
     defer gpa.free(stdin_bytes);
@@ -34,16 +44,20 @@ pub fn main(init: std.process.Init) !void {
     // placeholder cell encodes the id via `38;5;<id>` (see kitty.placeholderGrid).
     const image_id: u32 = 100 + tier_idx;
 
-    const png_bytes = readFace(gpa, io, cfg, tier_idx);
-    defer if (png_bytes) |b| gpa.free(b);
+    const fps = config.effectiveFps(cfg, tier_idx);
+    const gap_ms = gapMs(fps);
+
+    var loaded = loadFrames(gpa, io, cfg, tier_idx);
+    defer if (loaded) |*l| l.deinit(gpa);
 
     const caps = detectCaps(environ);
 
     var dbg: std.ArrayList(u8) = .empty;
     defer dbg.deinit(gpa);
-    dbg.print(gpa, "tmux={} kitty_capable={} tmux_pane={s} png_len={?d} box_cols={d}\n", .{
+    dbg.print(gpa, "tmux={} kitty_capable={} tmux_pane={s} frames={?d} fps={d} gap_ms={d} box_cols={d}\n", .{
         caps.tmux,                      caps.kitty_capable,
-        caps.tmux_pane orelse "(null)", if (png_bytes) |b| b.len else null,
+        caps.tmux_pane orelse "(null)", if (loaded) |l| l.bytes.len else null,
+        fps,                            gap_ms,
         cfg.sprite.box_cols,
     }) catch {};
 
@@ -60,9 +74,14 @@ pub fn main(init: std.process.Init) !void {
     // and a non-graphics host simply drops them (best-effort, matches proto).
     const can_graphics = caps.kitty_capable or caps.tmux;
     dbg.print(gpa, "can_graphics={} image_id={d}\n", .{ can_graphics, image_id }) catch {};
-    if (can_graphics and png_bytes != null) {
-        const tmpdir = environ.getPosix("TMPDIR");
-        if (tryGraphics(gpa, io, caps, tmpdir, image_id, png_bytes.?, rows.line_count, cfg.sprite.box_cols, &dbg)) {
+    if (can_graphics and loaded != null) {
+        const env_paths: StateEnv = .{
+            .xdg_state_home = environ.getPosix("XDG_STATE_HOME"),
+            .home = environ.getPosix("HOME"),
+        };
+        const animated = tierAnimated(loaded.?.bytes.len, fps, cfg.sprite.animate);
+        dbg.print(gpa, "animated={} max_fps={d}\n", .{ animated, cfg.sprite.max_fps }) catch {};
+        if (tryGraphics(gpa, io, caps, env_paths, tier_idx, image_id, fps, gap_ms, cfg.sprite.max_fps, cfg.sprite.daemon_ttl_ms, animated, loaded.?, rows.line_count, cfg.sprite.box_cols, &dbg)) {
             if (kitty.placeholderGrid(gpa, image_id, rows.line_count, cfg.sprite.box_cols) catch null) |g| {
                 grid = g;
                 var count: usize = 0;
@@ -94,6 +113,40 @@ pub fn main(init: std.process.Init) !void {
     const stdout = std.Io.File.stdout();
     try stdout.writeStreamingAll(io, block);
     try stdout.writeStreamingAll(io, "\n");
+
+    if (environ.getPosix("SL_SPRITE_DEBUG")) |dbg_path| {
+        if (std.Io.Dir.createFileAbsolute(io, dbg_path, .{})) |f| {
+            var f_mut = f;
+            defer f_mut.close(io);
+            f_mut.writeStreamingAll(io, dbg.items) catch {};
+        } else |_| {}
+    }
+}
+
+/// Collect argv into a slice backed by `arena` (whole-process lifetime), so the
+/// pure `daemon.classify` can scan it. On POSIX the arg bytes point into the OS
+/// argv and outlive the process anyway.
+fn collectArgv(arena: std.mem.Allocator, args: std.process.Args) []const []const u8 {
+    var list: std.ArrayList([]const u8) = .empty;
+    var it = args.iterate();
+    while (it.next()) |arg| list.append(arena, arg) catch break;
+    return list.toOwnedSlice(arena) catch &.{};
+}
+
+/// `--ensure-daemon <manifest>` handler: run the ensure-check once and print the
+/// spawned daemon's pid (nothing if a daemon was already running). A hook for
+/// the integration harness to exercise `ensureDaemon` from a real parent that
+/// then exits, proving detachment.
+fn ensureDaemonMain(gpa: std.mem.Allocator, io: Io, manifest_path: []const u8) !void {
+    const lock_path = anim.daemonLockPathFromManifest(gpa, manifest_path) catch return;
+    defer gpa.free(lock_path);
+
+    const pid = daemon.ensureDaemon(gpa, io, lock_path, manifest_path) catch return;
+    if (pid) |p| {
+        var buf: [32]u8 = undefined;
+        const s = std.fmt.bufPrint(&buf, "{d}\n", .{p}) catch return;
+        std.Io.File.stdout().writeStreamingAll(io, s) catch {};
+    }
 }
 
 fn readStdin(gpa: std.mem.Allocator, io: Io) ![]u8 {
@@ -102,23 +155,89 @@ fn readStdin(gpa: std.mem.Allocator, io: Io) ![]u8 {
     return fr.interface.allocRemaining(gpa, .limited(1 << 20));
 }
 
-/// Resolve and read the tier's face PNG. Any failure yields null (no sprite).
-fn readFace(gpa: std.mem.Allocator, io: Io, cfg: config.Config, tier_idx: u32) ?[]u8 {
-    var derived: ?[][]u8 = null;
-    defer if (derived) |d| config.freeFaces(gpa, d);
+/// Per-frame gap in milliseconds: round(1000 / fps). fps == 0 means a static
+/// tier and yields 0, which buildGraphicsPayload treats as "no animation".
+fn gapMs(fps: u32) u32 {
+    if (fps == 0) return 0;
+    return @intFromFloat(@round(1000.0 / @as(f64, @floatFromInt(fps))));
+}
 
-    const face_path: []const u8 = blk: {
-        if (cfg.sprite.faces) |faces| {
-            if (faces.len == 0) return null;
-            break :blk faces[@min(@as(usize, tier_idx), faces.len - 1)];
-        }
-        const d = config.deriveFaces(gpa, cfg.sprite.dir, cfg.sprite.tiers) catch return null;
-        derived = d;
-        if (d.len == 0) return null;
-        break :blk d[@min(@as(usize, tier_idx), d.len - 1)];
+/// A tier animates iff it has more than one frame, a positive effective fps, and
+/// the master animate switch is on. Otherwise it is static (frame 0 only), which
+/// also means no daemon, manifest, or heartbeat.
+fn tierAnimated(frame_count: usize, fps: u32, animate: bool) bool {
+    return frame_count > 1 and fps > 0 and animate;
+}
+
+/// Resolve `path` to an absolute path against `cwd` (itself absolute): an
+/// already-absolute path comes back normalized, a relative one joined onto cwd.
+/// Pure/lexical (no filesystem access). The animator daemon runs from a
+/// different cwd, so manifest frame paths must be absolute. Caller owns it.
+fn absPath(gpa: std.mem.Allocator, cwd: []const u8, path: []const u8) ![]u8 {
+    return std.fs.path.resolve(gpa, &.{ cwd, path });
+}
+
+/// The tier's frame contents, their absolute paths (for the manifest), and the
+/// stat signature the refresh state gates on.
+const LoadedFrames = struct {
+    bytes: []const []const u8,
+    /// Absolute paths, index-aligned with `bytes`.
+    paths: []const []const u8,
+    sig: u64,
+
+    fn deinit(self: *LoadedFrames, gpa: std.mem.Allocator) void {
+        for (self.bytes) |b| gpa.free(b);
+        gpa.free(self.bytes);
+        for (self.paths) |p| gpa.free(p);
+        gpa.free(self.paths);
+    }
+};
+
+/// Resolve the tier's frames, then read and stat each one. Any failure yields
+/// null (no sprite) -- the same degradation as a missing face PNG today.
+fn loadFrames(gpa: std.mem.Allocator, io: Io, cfg: config.Config, tier_idx: u32) ?LoadedFrames {
+    const paths = (frames.resolveTierFrames(gpa, io, cfg, tier_idx) catch null) orelse return null;
+    defer frames.freeFrames(gpa, paths);
+
+    const cwd = std.Io.Dir.cwd().realPathFileAlloc(io, ".", gpa) catch return null;
+    defer gpa.free(cwd);
+
+    var bytes: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (bytes.items) |b| gpa.free(b);
+        bytes.deinit(gpa);
+    }
+    var abs_paths: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (abs_paths.items) |p| gpa.free(p);
+        abs_paths.deinit(gpa);
+    }
+    var stats: std.ArrayList(state.FrameStat) = .empty;
+    defer stats.deinit(gpa);
+
+    for (paths) |path| {
+        const st = std.Io.Dir.cwd().statFile(io, path, .{}) catch return null;
+        const b = std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(1 << 20)) catch return null;
+        bytes.append(gpa, b) catch {
+            gpa.free(b);
+            return null;
+        };
+        const abs = absPath(gpa, cwd, path) catch return null;
+        abs_paths.append(gpa, abs) catch {
+            gpa.free(abs);
+            return null;
+        };
+        stats.append(gpa, .{ .size = st.size, .mtime = st.mtime.nanoseconds }) catch return null;
+    }
+
+    const sig = state.frameSignature(stats.items);
+    const owned_bytes = bytes.toOwnedSlice(gpa) catch return null;
+    const owned_paths = abs_paths.toOwnedSlice(gpa) catch {
+        for (owned_bytes) |b| gpa.free(b);
+        gpa.free(owned_bytes);
+        return null;
     };
-
-    return std.Io.Dir.cwd().readFileAlloc(io, face_path, gpa, .limited(1 << 20)) catch null;
+    return .{ .bytes = owned_bytes, .paths = owned_paths, .sig = sig };
 }
 
 const Caps = struct {
@@ -127,9 +246,17 @@ const Caps = struct {
     /// The `%N` pane this process belongs to (from $TMUX_PANE). Null outside
     /// tmux. Used to target `tmux display -t` at the correct pane's tty.
     tmux_pane: ?[]const u8,
-    /// $KITTY_WINDOW_ID verbatim; keys the transmit cache so a restarted kitty
-    /// (fresh image store, same /dev/tty ctime) doesn't hit a stale entry.
+    /// $KITTY_WINDOW_ID verbatim; keys the refresh state so distinct kitty
+    /// windows keep distinct records. It does NOT detect a restarted kitty
+    /// (ids restart from 1) — the state TTL bounds that staleness instead.
     kitty_window_id: ?[]const u8,
+};
+
+/// Environment inputs for state.resolveStatePath, threaded from main so
+/// tryGraphics stays free of direct environ reads.
+const StateEnv = struct {
+    xdg_state_home: ?[]const u8,
+    home: ?[]const u8,
 };
 
 fn detectCaps(environ: std.process.Environ) Caps {
@@ -162,18 +289,25 @@ fn detectCaps(environ: std.process.Environ) Caps {
     };
 }
 
-/// Open the graphics target and write delete/transmit/placement escapes,
-/// unless the transmit cache says this (tty, image_id, png) already landed --
-/// re-writing every refresh races Claude Code's own writes on the same tty
-/// (interleaving mid-DCS corrupts the terminal) and blinks the sprite.
+/// Open the graphics target and write the full escape sequence for the tier,
+/// unless the refresh state says this exact (tier, image id, fps, frames)
+/// already landed on this tty -- re-writing every refresh races Claude Code's
+/// own writes on the same tty (interleaving mid-DCS corrupts the terminal),
+/// blinks the sprite, and would restart the terminal-side animation loop.
 /// Returns true only if everything succeeded; any failure degrades to no sprite.
 fn tryGraphics(
     gpa: std.mem.Allocator,
     io: Io,
     caps: Caps,
-    tmpdir: ?[]const u8,
+    env_paths: StateEnv,
+    tier_idx: u32,
     image_id: u32,
-    png: []const u8,
+    fps: u32,
+    gap_ms: u32,
+    max_fps: u32,
+    daemon_ttl_ms: u32,
+    animated: bool,
+    loaded: LoadedFrames,
     box_rows: u32,
     box_cols: u32,
     dbg: *std.ArrayList(u8),
@@ -203,53 +337,130 @@ fn tryGraphics(
         tty_path = out;
     }
 
-    // Cache setup is best-effort: any failure means "no caching", never "no
+    // State setup is best-effort: any failure means "no gating", never "no
     // sprite". The exclusive lock also serializes concurrent statusline
     // instances so their tty writes can't interleave.
-    const png_hash = std.hash.XxHash64.hash(0, png);
-    var locked: ?cache.Locked = null;
+    var locked: ?state.Locked = null;
     defer if (locked) |*l| l.close(io);
-    var tty_ctime: i96 = 0;
 
-    if (std.Io.Dir.cwd().statFile(io, tty_path, .{})) |st| {
-        tty_ctime = st.ctime.nanoseconds;
-        if (cache.statePath(gpa, tmpdir, tty_path, caps.kitty_window_id) catch null) |path| {
-            defer gpa.free(path);
-            locked = cache.Locked.open(io, path) catch null;
-        }
-    } else |e| {
-        dbg.print(gpa, "stat tty {s} failed: {} (cache bypassed)\n", .{ tty_path, e }) catch {};
+    const key = state.stateKey(tty_path, caps.kitty_window_id, caps.tmux_pane);
+    if (state.resolveStatePath(gpa, env_paths.xdg_state_home, env_paths.home, key) catch null) |path| {
+        defer gpa.free(path);
+        locked = state.Locked.open(io, path) catch null;
     }
 
-    if (locked) |l| {
-        if (cache.isHit(l.state, tty_ctime, image_id, png_hash)) {
-            dbg.print(gpa, "cache=hit id={d}\n", .{image_id}) catch {};
-            return true;
+    const current: state.State = .{
+        .tier = tier_idx,
+        .image_id = image_id,
+        .fps = fps,
+        .frame_sig = loaded.sig,
+    };
+
+    // A hit must NOT touch the state file: its mtime marks the last transmit,
+    // so the TTL forces one retransmit ~10 min after that, bounding staleness
+    // from a restarted terminal whose image store is gone while the state still
+    // says "transmitted".
+    const hit = if (locked) |l| blk: {
+        const now_ns = Io.Timestamp.now(io, .real).nanoseconds;
+        const h = state.matches(l.state, current) and !state.isExpired(l.mtime_ns, now_ns);
+        dbg.print(gpa, "state={s} id={d}\n", .{ if (h) "hit" else "miss", image_id }) catch {};
+        break :blk h;
+    } else blk: {
+        dbg.print(gpa, "state=bypass\n", .{}) catch {};
+        break :blk false;
+    };
+
+    // On a hit, frame 0 is already on the tty; skip the transmit (re-writing
+    // would delete-and-replace mid-animation, blinking the sprite back to frame
+    // 0 and racing Claude Code's own tty writes). The animated upkeep below
+    // still runs -- the daemon must stay fed regardless.
+    if (!hit) {
+        const tty = std.Io.Dir.openFileAbsolute(io, tty_path, .{ .mode = .write_only }) catch |e| {
+            dbg.print(gpa, "open tty {s} failed: {}\n", .{ tty_path, e }) catch {};
+            return false;
+        };
+        defer tty.close(io);
+
+        buildAndWrite(gpa, io, tty, caps.tmux, image_id, loaded.bytes, box_rows, box_cols) catch |e| {
+            dbg.print(gpa, "buildAndWrite failed: {}\n", .{e}) catch {};
+            return false;
+        };
+        dbg.print(gpa, "graphics written to {s}\n", .{tty_path}) catch {};
+
+        // Only a confirmed write gets recorded; a failed commit just means a
+        // redundant retransmit next frame.
+        if (locked) |*l| {
+            l.state = current;
+            l.commit(gpa, io) catch {};
         }
-        dbg.print(gpa, "cache=miss id={d}\n", .{image_id}) catch {};
-    } else {
-        dbg.print(gpa, "cache=bypass\n", .{}) catch {};
     }
 
-    const tty = std.Io.Dir.openFileAbsolute(io, tty_path, .{ .mode = .write_only }) catch |e| {
-        dbg.print(gpa, "open tty {s} failed: {}\n", .{ tty_path, e }) catch {};
-        return false;
-    };
-    defer tty.close(io);
-
-    buildAndWrite(gpa, io, tty, caps.tmux, image_id, png, box_rows, box_cols) catch |e| {
-        dbg.print(gpa, "buildAndWrite failed: {}\n", .{e}) catch {};
-        return false;
-    };
-    dbg.print(gpa, "graphics written to {s}\n", .{tty_path}) catch {};
-
-    // Only a confirmed write gets recorded; a failed commit just means a
-    // redundant retransmit next frame.
-    if (locked) |*l| {
-        cache.record(&l.state, tty_ctime, image_id, png_hash);
-        l.commit(gpa, io) catch {};
+    // Animated tiers refresh the manifest, touch the heartbeat, and ensure the
+    // daemon on EVERY invocation (hit or miss) -- done after the transmit so the
+    // daemon can't clobber our frame-0 bytes before they land. Static tiers do
+    // none of this. All best-effort: a failure never downgrades a placed sprite.
+    if (animated) {
+        animatedUpkeep(gpa, io, env_paths, key, image_id, gap_ms, max_fps, daemon_ttl_ms, caps.tmux, tty_path, loaded, dbg);
     }
     return true;
+}
+
+/// Feed the resident animator daemon for an animated tier: touch the heartbeat,
+/// rewrite the manifest with the current tier's absolute frame paths, and ensure
+/// a daemon is running. Every step is best-effort (any failure is logged and
+/// skipped) so it can never turn a successfully-placed sprite into no sprite.
+fn animatedUpkeep(
+    gpa: std.mem.Allocator,
+    io: Io,
+    env_paths: StateEnv,
+    key: u64,
+    image_id: u32,
+    gap_ms: u32,
+    max_fps: u32,
+    daemon_ttl_ms: u32,
+    tmux: bool,
+    tty_path: []const u8,
+    loaded: LoadedFrames,
+    dbg: *std.ArrayList(u8),
+) void {
+    const xdg = env_paths.xdg_state_home;
+    const home = env_paths.home;
+
+    if (anim.heartbeatPath(gpa, xdg, home, key)) |hb| {
+        defer gpa.free(hb);
+        anim.touchHeartbeat(io, hb) catch |e| dbg.print(gpa, "heartbeat failed: {}\n", .{e}) catch {};
+    } else |_| {}
+
+    const manifest_path = anim.manifestPath(gpa, xdg, home, key) catch return;
+    defer gpa.free(manifest_path);
+
+    // Normalise the tty to an absolute path (it already is, in practice) so the
+    // manifest's absolute-path invariant holds even for a hand-set target.
+    const abs_tty = std.fs.path.resolve(gpa, &.{tty_path}) catch return;
+    defer gpa.free(abs_tty);
+
+    const manifest: anim.Manifest = .{
+        .image_id = image_id,
+        .gap_ms = gap_ms,
+        .max_fps = max_fps,
+        .daemon_ttl_ms = daemon_ttl_ms,
+        .tmux = tmux,
+        .tty_path = abs_tty,
+        .frames = loaded.paths,
+        .frame_sig = loaded.sig,
+    };
+    anim.writeManifest(gpa, io, manifest_path, manifest) catch |e| {
+        dbg.print(gpa, "writeManifest failed: {}\n", .{e}) catch {};
+        return;
+    };
+
+    const lock_path = anim.daemonLockPath(gpa, xdg, home, key) catch return;
+    defer gpa.free(lock_path);
+    if (daemon.ensureDaemon(gpa, io, lock_path, manifest_path)) |pid| {
+        dbg.print(gpa, "ensureDaemon spawned={?d}\n", .{pid}) catch {};
+    } else |e| {
+        dbg.print(gpa, "ensureDaemon failed: {}\n", .{e}) catch {};
+    }
 }
 
 fn buildAndWrite(
@@ -258,12 +469,35 @@ fn buildAndWrite(
     tty: std.Io.File,
     tmux: bool,
     image_id: u32,
-    png: []const u8,
+    frame_bytes: []const []const u8,
     box_rows: u32,
     box_cols: u32,
 ) !void {
+    const payload = try buildGraphicsPayload(gpa, tmux, image_id, frame_bytes, box_rows, box_cols);
+    defer gpa.free(payload);
+    try tty.writeStreamingAll(io, payload);
+}
+
+/// Assemble the static graphics escape payload for one image id: delete ->
+/// transmit frame 0 -> virtual placement. Byte-identical to `staticSequence`.
+/// With `tmux` set, every APC is individually passthrough-wrapped. Caller owns
+/// the result.
+///
+/// Motion for animated tiers comes from the resident animator daemon
+/// (SPEC-007), which re-transmits frames via bare `a=t`; the retired kitty
+/// `a=f`/`a=a` animation escapes are never emitted here.
+pub fn buildGraphicsPayload(
+    gpa: std.mem.Allocator,
+    tmux: bool,
+    image_id: u32,
+    frame_bytes: []const []const u8,
+    box_rows: u32,
+    box_cols: u32,
+) ![]u8 {
+    std.debug.assert(frame_bytes.len >= 1);
+
     var payload: std.ArrayList(u8) = .empty;
-    defer payload.deinit(gpa);
+    errdefer payload.deinit(gpa);
 
     {
         const esc = try kitty.delete(gpa, image_id);
@@ -271,7 +505,7 @@ fn buildAndWrite(
         try appendMaybeTmux(gpa, &payload, tmux, esc);
     }
     {
-        const esc = try kitty.transmit(gpa, image_id, png, .{});
+        const esc = try kitty.transmit(gpa, image_id, frame_bytes[0], .{});
         defer gpa.free(esc);
         try appendMaybeTmux(gpa, &payload, tmux, esc);
     }
@@ -281,7 +515,7 @@ fn buildAndWrite(
         try appendMaybeTmux(gpa, &payload, tmux, esc);
     }
 
-    try tty.writeStreamingAll(io, payload.items);
+    return payload.toOwnedSlice(gpa);
 }
 
 fn appendMaybeTmux(
@@ -304,6 +538,181 @@ test {
     _ = @import("statusline.zig");
     _ = @import("tier.zig");
     _ = @import("kitty.zig");
+    _ = @import("frames.zig");
     _ = @import("rows.zig");
-    _ = @import("cache.zig");
+    _ = @import("state.zig");
+    _ = @import("anim.zig");
+    _ = @import("daemon.zig");
+}
+
+test "gapMs: fps 0 means static and yields 0" {
+    try std.testing.expectEqual(@as(u32, 0), gapMs(0));
+}
+
+test "gapMs rounds 1000/fps to the nearest millisecond" {
+    try std.testing.expectEqual(@as(u32, 125), gapMs(8));
+    // 1000/16 = 62.5; @round rounds half away from zero.
+    try std.testing.expectEqual(@as(u32, 63), gapMs(16));
+    try std.testing.expectEqual(@as(u32, 33), gapMs(30));
+    try std.testing.expectEqual(@as(u32, 1000), gapMs(1));
+    // fps beyond 1000 rounds down to 0: no per-frame gap survives.
+    try std.testing.expectEqual(@as(u32, 0), gapMs(3000));
+}
+
+/// The pre-animation static sequence (delete + transmit + placement), built
+/// from the independently-tested kitty builders. The static path of
+/// buildGraphicsPayload must be byte-identical to this.
+fn staticSequence(
+    a: std.mem.Allocator,
+    image_id: u32,
+    png: []const u8,
+    box_rows: u32,
+    box_cols: u32,
+) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(a);
+    const del = try kitty.delete(a, image_id);
+    defer a.free(del);
+    try out.appendSlice(a, del);
+    const tr = try kitty.transmit(a, image_id, png, .{});
+    defer a.free(tr);
+    try out.appendSlice(a, tr);
+    const pl = try kitty.virtualPlacement(a, image_id, box_rows, box_cols);
+    defer a.free(pl);
+    try out.appendSlice(a, pl);
+    return out.toOwnedSlice(a);
+}
+
+/// Parse a byte stream that must consist ONLY of tmux passthrough units
+/// (`ESC Ptmux; <esc-doubled body> ESC \`). Returns the concatenated
+/// un-doubled bodies; errors on any bytes outside a wrapper or any bare ESC
+/// inside one.
+fn unwrapTmuxUnits(a: std.mem.Allocator, wrapped: []const u8, count_out: *usize) ![]u8 {
+    const prefix = "\x1bPtmux;";
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(a);
+    var count: usize = 0;
+    var i: usize = 0;
+    while (i < wrapped.len) {
+        if (!std.mem.startsWith(u8, wrapped[i..], prefix)) return error.BytesOutsideWrapper;
+        i += prefix.len;
+        count += 1;
+        while (true) {
+            if (i >= wrapped.len) return error.UnterminatedWrapper;
+            const b = wrapped[i];
+            if (b != 0x1b) {
+                try out.append(a, b);
+                i += 1;
+                continue;
+            }
+            if (i + 1 >= wrapped.len) return error.UnterminatedWrapper;
+            switch (wrapped[i + 1]) {
+                0x1b => {
+                    try out.append(a, 0x1b);
+                    i += 2;
+                },
+                '\\' => {
+                    i += 2;
+                    break;
+                },
+                else => return error.BareEscapeInWrapper,
+            }
+        }
+    }
+    count_out.* = count;
+    return out.toOwnedSlice(a);
+}
+
+test "tierAnimated: needs >1 frame, positive fps, and the animate switch" {
+    try std.testing.expect(tierAnimated(3, 8, true));
+    try std.testing.expect(!tierAnimated(1, 8, true)); // single frame
+    try std.testing.expect(!tierAnimated(3, 0, true)); // fps 0
+    try std.testing.expect(!tierAnimated(3, 8, false)); // animate off
+    try std.testing.expect(!tierAnimated(0, 8, true)); // no frames
+}
+
+test "absPath: keeps an absolute path, joins a relative one onto cwd" {
+    const a = std.testing.allocator;
+
+    const kept = try absPath(a, "/home/me/proj", "/opt/sprites/0.png");
+    defer a.free(kept);
+    try std.testing.expectEqualStrings("/opt/sprites/0.png", kept);
+
+    const joined = try absPath(a, "/home/me/proj", "test-sprites/anim/0.png");
+    defer a.free(joined);
+    try std.testing.expectEqualStrings("/home/me/proj/test-sprites/anim/0.png", joined);
+
+    // The repo-relative default (`./test-sprites`) normalises the leading `.`.
+    const dotted = try absPath(a, "/home/me/proj", "./test-sprites/face0.png");
+    defer a.free(dotted);
+    try std.testing.expectEqualStrings("/home/me/proj/test-sprites/face0.png", dotted);
+}
+
+test "buildGraphicsPayload: N=1 is byte-identical to the static sequence, no a=f/a=a" {
+    const a = std.testing.allocator;
+    const out = try buildGraphicsPayload(a, false, 103, &.{"F0"}, 3, 6);
+    defer a.free(out);
+
+    const expected = try staticSequence(a, 103, "F0", 3, 6);
+    defer a.free(expected);
+    try std.testing.expectEqualSlices(u8, expected, out);
+
+    try std.testing.expect(std.mem.indexOf(u8, out, "a=f") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "a=a") == null);
+}
+
+test "buildGraphicsPayload: N>1 still yields only the static frame-0 sequence" {
+    const a = std.testing.allocator;
+    // Extra frames belong to the daemon now; the statusline transmits frame 0
+    // only, byte-identical to the static sequence.
+    const out = try buildGraphicsPayload(a, false, 103, &.{ "F0", "F1", "F2" }, 3, 6);
+    defer a.free(out);
+
+    const expected = try staticSequence(a, 103, "F0", 3, 6);
+    defer a.free(expected);
+    try std.testing.expectEqualSlices(u8, expected, out);
+    try std.testing.expect(std.mem.indexOf(u8, out, "a=f") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "a=a") == null);
+}
+
+test "buildGraphicsPayload: static order is delete, a=t, placement" {
+    const a = std.testing.allocator;
+    const out = try buildGraphicsPayload(a, false, 103, &.{ "F0", "F1", "F2" }, 3, 6);
+    defer a.free(out);
+
+    const idx_delete = std.mem.indexOf(u8, out, "a=d,").?;
+    const idx_transmit = std.mem.indexOf(u8, out, "a=t,").?;
+    const idx_place = std.mem.indexOf(u8, out, "a=p,").?;
+    try std.testing.expect(idx_delete < idx_transmit);
+    try std.testing.expect(idx_transmit < idx_place);
+
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, out, "a=t"));
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, out, "a=f"));
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, out, "a=a"));
+}
+
+test "buildGraphicsPayload: tmux wraps every APC individually and nothing else" {
+    const a = std.testing.allocator;
+    const frame_list: []const []const u8 = &.{ "F0", "F1", "F2" };
+
+    const wrapped = try buildGraphicsPayload(a, true, 103, frame_list, 3, 6);
+    defer a.free(wrapped);
+    const plain = try buildGraphicsPayload(a, false, 103, frame_list, 3, 6);
+    defer a.free(plain);
+
+    var count: usize = 0;
+    const unwrapped = try unwrapTmuxUnits(a, wrapped, &count);
+    defer a.free(unwrapped);
+
+    // delete + a=t + placement
+    try std.testing.expectEqual(@as(usize, 3), count);
+    try std.testing.expectEqual(@as(usize, 3), std.mem.count(u8, wrapped, "\x1bPtmux;"));
+    try std.testing.expectEqualSlices(u8, plain, unwrapped);
+
+    // any \x1b_G must be the doubled-ESC form inside a wrapper
+    var pos: usize = 0;
+    while (std.mem.indexOfPos(u8, wrapped, pos, "\x1b_G")) |i| {
+        try std.testing.expect(i > 0 and wrapped[i - 1] == 0x1b);
+        pos = i + 1;
+    }
 }

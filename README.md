@@ -51,6 +51,31 @@ Then set it as your Claude Code statusline command in `~/.claude/settings.json`:
 { "statusLine": { "type": "command", "command": "statusline-sprite" } }
 ```
 
+## Animated sprites
+
+A tier can animate. Make the tier a directory of numbered frames (`0.png`, `1.png`, …) instead of a single PNG. A single PNG stays static.
+
+```toml
+[sprite]
+faces = ["/path/to/idle", "/path/to/busy"]   # each is a dir of 0.png, 1.png, ...
+```
+
+```
+busy/
+  0.png
+  1.png
+  2.png
+```
+
+A background daemon cycles the frames via the kitty graphics protocol, so sprites animate even on terminals that don't implement the kitty *animation* protocol. `fps` / `tier_fps` set the rate, capped by `max_fps`.
+
+**Terminal support.** Animation is verified on Ghostty (under tmux, the primary target) and works on kitty. The older terminal-side animation escapes (`a=f` / `a=a`) are no longer used.
+
+**The daemon.** One resident background process per pane, spawned automatically by the statusline. It auto-exits about `daemon_ttl_ms` (default 5000ms) after Claude Code stops refreshing — idle sessions stop animating and the daemon goes away; the next refresh respawns it. Closing the pane/terminal also stops it.
+
+- Disable animation entirely with `animate = false` (renders static frame 0, no daemon).
+- To kill a stuck daemon: it exits on its own within `daemon_ttl_ms`, or when its pane/terminal closes. To force it: `pkill -f 'statusline-sprite --animate'`.
+
 ---
 
 Doom guy sprite © id Software, shown for demo purposes only — not covered by this project's MIT license.

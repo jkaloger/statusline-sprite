@@ -41,11 +41,13 @@ fn appendCodepoint(out: *std.ArrayList(u8), allocator: std.mem.Allocator, cp: u2
     try out.appendSlice(allocator, buf[0..n]);
 }
 
-/// Transmit a PNG for `image_id` as one or more graphics APCs.
-/// First chunk carries `a=t,f=100,i=<id>`; subsequent chunks carry only `m`.
-pub fn transmit(
+/// Base64-encode `png_bytes` and emit it as chunked APCs. The first chunk's
+/// control is `<first_prefix>m=<0|1>`, continuations `<cont_prefix>m=<0|1>`;
+/// prefixes must therefore end in ',' when non-empty.
+fn transmitChunked(
     allocator: std.mem.Allocator,
-    image_id: u32,
+    first_prefix: []const u8,
+    cont_prefix: []const u8,
     png_bytes: []const u8,
     opts: TransmitOptions,
 ) ![]u8 {
@@ -64,10 +66,8 @@ pub fn transmit(
         const chunk = b64[offset..end];
         const more = end < b64.len;
 
-        const control = if (first)
-            try std.fmt.allocPrint(allocator, "a=t,f=100,i={d},q=2,m={d}", .{ image_id, @intFromBool(more) })
-        else
-            try std.fmt.allocPrint(allocator, "m={d}", .{@intFromBool(more)});
+        const prefix = if (first) first_prefix else cont_prefix;
+        const control = try std.fmt.allocPrint(allocator, "{s}m={d}", .{ prefix, @intFromBool(more) });
         defer allocator.free(control);
         try appendApc(&out, allocator, control, chunk);
 
@@ -77,6 +77,58 @@ pub fn transmit(
     }
 
     return out.toOwnedSlice(allocator);
+}
+
+/// Transmit a PNG for `image_id` as one or more graphics APCs.
+/// First chunk carries `a=t,f=100,i=<id>`; subsequent chunks carry only `m`.
+pub fn transmit(
+    allocator: std.mem.Allocator,
+    image_id: u32,
+    png_bytes: []const u8,
+    opts: TransmitOptions,
+) ![]u8 {
+    const first_prefix = try std.fmt.allocPrint(allocator, "a=t,f=100,i={d},q=2,", .{image_id});
+    defer allocator.free(first_prefix);
+    return transmitChunked(allocator, first_prefix, "", png_bytes, opts);
+}
+
+/// Transmit a PNG as a new animation frame of `image_id`: `a=f`. `z` on the
+/// first chunk is that frame's gap to the next frame in milliseconds (kitty
+/// ignores z=0). With `r` absent a new frame is appended. Unlike `a=t`,
+/// continuation chunks must repeat `a=f` — the protocol requires it on every
+/// escape of a frame transmission.
+pub fn transmitFrame(
+    allocator: std.mem.Allocator,
+    image_id: u32,
+    gap_ms: u32,
+    png_bytes: []const u8,
+    opts: TransmitOptions,
+) ![]u8 {
+    const first_prefix = try std.fmt.allocPrint(
+        allocator,
+        "a=f,f=100,i={d},z={d},q=2,",
+        .{ image_id, gap_ms },
+    );
+    defer allocator.free(first_prefix);
+    return transmitChunked(allocator, first_prefix, "a=f,q=2,", png_bytes, opts);
+}
+
+/// Set the root frame's gap: `a=a,i=<id>,r=1,z=<gap_ms>`. The `a=t` root
+/// transmission is frame 1 and carries no gap, so without this it would flash
+/// past instead of displaying for one frame period. No payload.
+pub fn setRootFrameGap(allocator: std.mem.Allocator, image_id: u32, gap_ms: u32) ![]u8 {
+    return std.fmt.allocPrint(
+        allocator,
+        "\x1b_Ga=a,i={d},r=1,z={d},q=2\x1b\\",
+        .{ image_id, gap_ms },
+    );
+}
+
+/// Start terminal-side playback: `a=a,i=<id>,s=3,v=1`. `s=3` runs the
+/// animation, looping back to the first frame after the last; `v=1` loops
+/// infinitely (`v=0` is ignored, `v=N` loops N-1 times). No payload.
+pub fn runAnimation(allocator: std.mem.Allocator, image_id: u32) ![]u8 {
+    return std.fmt.allocPrint(allocator, "\x1b_Ga=a,i={d},s=3,v=1,q=2\x1b\\", .{image_id});
 }
 
 /// Delete image `image_id` and its placements: `a=d,d=i,i=<id>`. No payload.
@@ -212,6 +264,90 @@ test "transmit: large payload chunks, flags m, and round-trips" {
     defer a.free(decoded);
     try Decoder.decode(decoded, payloads.items);
     try std.testing.expectEqualSlices(u8, &png, decoded);
+}
+
+test "transmitFrame: single small payload is one APC with a=f,f=100,i,z,q=2,m=0" {
+    const a = std.testing.allocator;
+    const out = try transmitFrame(a, 42, 125, "hi", .{});
+    defer a.free(out);
+
+    try std.testing.expect(std.mem.startsWith(u8, out, "\x1b_G"));
+    try std.testing.expect(std.mem.endsWith(u8, out, "\x1b\\"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, out, "\x1b_G"));
+    inline for (.{ "a=f", "f=100", "i=42", "z=125", "q=2", "m=0" }) |k|
+        try std.testing.expect(std.mem.indexOf(u8, out, k) != null);
+    // base64 of "hi" is "aGk="
+    try std.testing.expect(std.mem.indexOf(u8, out, "aGk=") != null);
+}
+
+test "transmitFrame: large payload chunks, flags m, z only on first, a=f and q=2 on all, and round-trips" {
+    const a = std.testing.allocator;
+    var png: [5000]u8 = undefined;
+    for (&png, 0..) |*b, i| b.* = @intCast(i % 251);
+
+    const out = try transmitFrame(a, 7, 250, &png, .{});
+    defer a.free(out);
+
+    var payloads: std.ArrayList(u8) = .empty;
+    defer payloads.deinit(a);
+
+    var count: usize = 0;
+    var first_control: []const u8 = "";
+    var last_control: []const u8 = "";
+    var it = std.mem.splitSequence(u8, out, "\x1b_G");
+    _ = it.next(); // leading empty segment
+    while (it.next()) |seg| {
+        count += 1;
+        const body = seg[0 .. seg.len - 2]; // strip trailing ESC \
+        const semi = std.mem.indexOfScalar(u8, body, ';').?;
+        const control = body[0..semi];
+        if (count == 1) first_control = control;
+        last_control = control;
+        // every chunk of an a=f transmission carries a=f and q=2
+        try std.testing.expect(std.mem.indexOf(u8, control, "a=f") != null);
+        try std.testing.expect(std.mem.indexOf(u8, control, "q=2") != null);
+        try payloads.appendSlice(a, body[semi + 1 ..]);
+    }
+
+    try std.testing.expect(count >= 2);
+    inline for (.{ "m=1", "f=100", "i=7", "z=250" }) |k|
+        try std.testing.expect(std.mem.indexOf(u8, first_control, k) != null);
+    try std.testing.expect(std.mem.indexOf(u8, last_control, "m=0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, last_control, "z=") == null);
+    try std.testing.expect(std.mem.indexOf(u8, last_control, "f=100") == null);
+    try std.testing.expect(std.mem.indexOf(u8, last_control, "i=") == null);
+
+    const Decoder = std.base64.standard.Decoder;
+    const decoded = try a.alloc(u8, try Decoder.calcSizeForSlice(payloads.items));
+    defer a.free(decoded);
+    try Decoder.decode(decoded, payloads.items);
+    try std.testing.expectEqualSlices(u8, &png, decoded);
+}
+
+test "setRootFrameGap: contains a=a,i,r=1,z,q=2, no payload" {
+    const a = std.testing.allocator;
+    const out = try setRootFrameGap(a, 103, 125);
+    defer a.free(out);
+
+    try std.testing.expect(std.mem.startsWith(u8, out, "\x1b_G"));
+    try std.testing.expect(std.mem.endsWith(u8, out, "\x1b\\"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, out, "\x1b_G"));
+    inline for (.{ "a=a", "i=103", "r=1", "z=125", "q=2" }) |k|
+        try std.testing.expect(std.mem.indexOf(u8, out, k) != null);
+    try std.testing.expect(std.mem.indexOfScalar(u8, out, ';') == null);
+}
+
+test "runAnimation: contains a=a,i,s=3,v=1,q=2, no payload" {
+    const a = std.testing.allocator;
+    const out = try runAnimation(a, 103);
+    defer a.free(out);
+
+    try std.testing.expect(std.mem.startsWith(u8, out, "\x1b_G"));
+    try std.testing.expect(std.mem.endsWith(u8, out, "\x1b\\"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, out, "\x1b_G"));
+    inline for (.{ "a=a", "i=103", "s=3", "v=1", "q=2" }) |k|
+        try std.testing.expect(std.mem.indexOf(u8, out, k) != null);
+    try std.testing.expect(std.mem.indexOfScalar(u8, out, ';') == null);
 }
 
 test "delete: contains a=d,d=i,i" {
