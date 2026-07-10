@@ -102,6 +102,14 @@ pub fn main(init: std.process.Init) !void {
     const stdout = std.Io.File.stdout();
     try stdout.writeStreamingAll(io, block);
     try stdout.writeStreamingAll(io, "\n");
+
+    if (environ.getPosix("SL_SPRITE_DEBUG")) |dbg_path| {
+        if (std.Io.Dir.createFileAbsolute(io, dbg_path, .{})) |f| {
+            var f_mut = f;
+            defer f_mut.close(io);
+            f_mut.writeStreamingAll(io, dbg.items) catch {};
+        } else |_| {}
+    }
 }
 
 fn readStdin(gpa: std.mem.Allocator, io: Io) ![]u8 {
