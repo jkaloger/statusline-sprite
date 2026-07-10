@@ -306,6 +306,33 @@ sleep 0.6
 [ "$(count_pat "$TTY10" 'a=t')" = "$C10" ] || fail "case 10: a daemon is transmitting despite animate=false"
 echo "  ok: animate=false rendered static frame 0, spawned no daemon"
 
+echo "== case 11: fps=0 on an animated dir -- static frame 0 only, no daemon =="
+mkdir -p "$WORK/xdg11/statusline-sprite"
+cat > "$WORK/xdg11/statusline-sprite/config.toml" <<EOF
+[sprite]
+faces = ["$WORK/sprites/anim"]
+fps = 0
+EOF
+TTY11="$WORK/tty11"
+STATE11="$(state_dir "$WORK/state11")"
+: > "$TTY11"
+
+printf '%s' "$SAMPLE_JSON" | run_tmux "$TTY11" HOME="$WORK/home11" XDG_CONFIG_HOME="$WORK/xdg11" XDG_STATE_HOME="$WORK/state11" > "$WORK/out11" || fail "case 11: non-zero exit ($?)"
+assert_three_lines "$WORK/out11" "case 11"
+[ -s "$TTY11" ] || fail "case 11: no graphics bytes reached the fake tty"
+grep -aq 'a=d,' "$TTY11" || fail "case 11: missing a=d delete"
+grep -aq 'a=t,' "$TTY11" || fail "case 11: missing a=t transmission"
+grep -aq 'a=p,' "$TTY11" || fail "case 11: missing a=p placement"
+grep -aq 'i=103' "$TTY11" || fail "case 11: expected image id 103 for tier 3"
+grep -aq 'a=f,' "$TTY11" && fail "case 11: fps=0 must not emit a=f"
+grep -aq 'a=a,' "$TTY11" && fail "case 11: fps=0 must not emit a=a"
+[ -z "$(anim_manifest "$STATE11")" ] || fail "case 11: fps=0 wrote a manifest"
+[ -z "$(heartbeat_file "$STATE11")" ] || fail "case 11: fps=0 wrote a heartbeat"
+C11="$(count_pat "$TTY11" 'a=t')"
+sleep 0.6
+[ "$(count_pat "$TTY11" 'a=t')" = "$C11" ] || fail "case 11: a daemon is transmitting despite fps=0"
+echo "  ok: fps=0 rendered static frame 0, spawned no daemon"
+
 echo "== teardown: reap any daemons; none should remain =="
 # Every animated run above was reaped inline (manifest removed -> daemon exits);
 # a final sweep guards against a straggler, and WORK removal on EXIT covers any
