@@ -6,6 +6,13 @@ box_cols = 6
 fps = 8                        # global frame rate for animated tiers (0 = static)
 tier_fps = [8, 8, 10, 12, 16]  # optional per-tier override, indexed by tier
 max_frames = 32                # sanity cap on frames per tier
+animate = true                 # master switch; false = static frame 0, no daemon
+max_fps = 30                   # cap on effective fps; bounds tty write frequency
+daemon_ttl_ms = 5000           # daemon exits this long after refreshes stop
+
+# An animated tier is a directory of numbered PNG frames (0.png, 1.png, ...);
+# a tier that is a single PNG stays static. Point a faces entry at a directory:
+# faces = ["/path/to/idle", "/path/to/busy"]
 
 [line1]
 command = "STARSHIP_SHELL= starship prompt"
