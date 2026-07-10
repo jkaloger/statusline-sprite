@@ -1,7 +1,7 @@
 ---
 title: client-side animated sprites via background animator daemon
 type: spec
-status: draft
+status: in-progress
 author: Jack Kaloger
 date: 2026-07-10
 tags: []
@@ -166,9 +166,11 @@ Loop:
 ### Animation manifest
 
 A per-target file in the state dir alongside `state-<key>`: `anim-<key>`.
-Line-based `key = value` like `state.zig`. Contents: image id, `gap_ms`, tmux
-flag, resolved **absolute** tty path, ordered **absolute** frame file paths,
-frame signature. Frame paths must be absolute: a detached daemon's cwd is not
+Line-based `key = value` like `state.zig`. Contents: image id, `gap_ms`,
+`max_fps` (the effective-gap floor; defaults to `30` when absent, for
+backward/forward compat — populated from config in T4/T6), tmux flag, resolved
+**absolute** tty path, ordered **absolute** frame file paths, frame signature.
+Frame paths must be absolute: a detached daemon's cwd is not
 guaranteed to match the statusline's (and `cfg.sprite.dir` defaults to the
 relative `"./test-sprites"` — `config.zig:52`; `frames.resolveTierFrames` builds
 paths against `Io.Dir.cwd()` — `frames.zig:22,47`). The statusline resolves cwd

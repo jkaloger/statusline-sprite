@@ -10,11 +10,19 @@ const Allocator = std.mem.Allocator;
 pub const Manifest = struct {
     image_id: u32,
     gap_ms: u32,
+    /// Hard fps cap (SPEC-007 config, default 30). The daemon clamps its tick
+    /// interval so it never transmits faster than this, bounding tty-write
+    /// frequency. T4/T6 populate it from config; a manifest written without the
+    /// field parses back at `default_max_fps` for forward/backward compat.
+    max_fps: u32,
     tmux: bool,
     tty_path: []const u8,
     frames: []const []const u8,
     frame_sig: u64,
 };
+
+/// Applied when a manifest omits `max_fps` (older writer, or a hand-edited file).
+pub const default_max_fps: u32 = 30;
 
 /// A parsed manifest whose strings live in an arena. Caller must `deinit`.
 pub const Parsed = struct {
@@ -97,8 +105,8 @@ pub fn serialize(allocator: Allocator, m: Manifest) ![]u8 {
 
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
-    try out.print(allocator, "image_id = {d}\ngap_ms = {d}\ntmux = {d}\ntty = {s}\nframe_sig = {x}\n", .{
-        m.image_id, m.gap_ms, @intFromBool(m.tmux), m.tty_path, m.frame_sig,
+    try out.print(allocator, "image_id = {d}\ngap_ms = {d}\nmax_fps = {d}\ntmux = {d}\ntty = {s}\nframe_sig = {x}\n", .{
+        m.image_id, m.gap_ms, m.max_fps, @intFromBool(m.tmux), m.tty_path, m.frame_sig,
     });
     for (m.frames) |f| try out.print(allocator, "frame = {s}\n", .{f});
     return out.toOwnedSlice(allocator);
@@ -110,6 +118,7 @@ pub fn serialize(allocator: Allocator, m: Manifest) ![]u8 {
 pub fn parse(allocator: Allocator, bytes: []const u8) Allocator.Error!?Parsed {
     var image_id: ?u32 = null;
     var gap_ms: ?u32 = null;
+    var max_fps: ?u32 = null;
     var tmux: ?bool = null;
     var frame_sig: ?u64 = null;
     var tty_path: ?[]const u8 = null;
@@ -129,6 +138,8 @@ pub fn parse(allocator: Allocator, bytes: []const u8) Allocator.Error!?Parsed {
             image_id = std.fmt.parseInt(u32, rhs, 10) catch return null;
         } else if (std.mem.eql(u8, key, "gap_ms")) {
             gap_ms = std.fmt.parseInt(u32, rhs, 10) catch return null;
+        } else if (std.mem.eql(u8, key, "max_fps")) {
+            max_fps = std.fmt.parseInt(u32, rhs, 10) catch return null;
         } else if (std.mem.eql(u8, key, "tmux")) {
             if (std.mem.eql(u8, rhs, "1")) {
                 tmux = true;
@@ -168,6 +179,7 @@ pub fn parse(allocator: Allocator, bytes: []const u8) Allocator.Error!?Parsed {
         .value = .{
             .image_id = id,
             .gap_ms = gap,
+            .max_fps = max_fps orelse default_max_fps,
             .tmux = tm,
             .tty_path = tty_dup,
             .frames = frame_dup,
@@ -235,6 +247,36 @@ pub fn readManifest(allocator: Allocator, io: Io, path: []const u8) !?Parsed {
     return locked.read(allocator, io);
 }
 
+/// Outcome of a daemon frame-loop manifest read.
+pub const TickRead = union(enum) {
+    /// The manifest file is gone — the daemon's stop signal.
+    gone,
+    /// Present but empty/corrupt/unreadable this tick: skip and keep looping.
+    invalid,
+    ok: Parsed,
+};
+
+/// Daemon-side locked read that NEVER creates the file. `Locked.open` (used by
+/// the statusline) creates the manifest if missing, which would resurrect a
+/// removed manifest and defeat the "manifest gone ⇒ exit" stop; this opens
+/// existing-only so a removal is observed as `.gone`. Takes the same exclusive
+/// lock as the statusline's write, then releases it on return (the caller sleeps
+/// without holding it). Allocation failure is the only error.
+pub fn readManifestTick(allocator: Allocator, io: Io, path: []const u8) Allocator.Error!TickRead {
+    const file = Io.Dir.openFileAbsolute(io, path, .{ .mode = .read_only, .lock = .exclusive }) catch |e| switch (e) {
+        error.FileNotFound => return .gone,
+        else => return .invalid,
+    };
+    defer file.close(io);
+
+    const st = file.stat(io) catch return .invalid;
+    const buf = try allocator.alloc(u8, @intCast(st.size));
+    defer allocator.free(buf);
+    const n = file.readPositionalAll(io, buf, 0) catch return .invalid;
+    if (try parse(allocator, buf[0..n])) |p| return .{ .ok = p };
+    return .invalid;
+}
+
 /// Bump the heartbeat file's mtime, creating it (and its parent dir) if needed.
 /// The statusline calls this on EVERY invocation, including the state-hit path.
 pub fn touchHeartbeat(io: Io, path: []const u8) !void {
@@ -261,6 +303,7 @@ fn sampleManifest() Manifest {
     return .{
         .image_id = 103,
         .gap_ms = 125,
+        .max_fps = 24,
         .tmux = true,
         .tty_path = test_tty,
         .frames = &.{ "/abs/face1/0.png", "/abs/face1/1.png", "/abs/face1/2.png" },
@@ -271,6 +314,7 @@ fn sampleManifest() Manifest {
 fn expectManifestEqual(expected: Manifest, actual: Manifest) !void {
     try std.testing.expectEqual(expected.image_id, actual.image_id);
     try std.testing.expectEqual(expected.gap_ms, actual.gap_ms);
+    try std.testing.expectEqual(expected.max_fps, actual.max_fps);
     try std.testing.expectEqual(expected.tmux, actual.tmux);
     try std.testing.expectEqual(expected.frame_sig, actual.frame_sig);
     try std.testing.expectEqualStrings(expected.tty_path, actual.tty_path);
@@ -301,6 +345,13 @@ test "parse yields null for missing, corrupt, or partial input" {
     try std.testing.expectEqual(@as(?Parsed, null), try parse(a, "image_id = nope\ngap_ms = 125\ntmux = 1\ntty = /dev/tty\nframe_sig = ff\nframe = /a/0.png\n"));
     // Non-boolean tmux.
     try std.testing.expectEqual(@as(?Parsed, null), try parse(a, "image_id = 103\ngap_ms = 125\ntmux = yes\ntty = /dev/tty\nframe_sig = ff\nframe = /a/0.png\n"));
+}
+
+test "parse defaults max_fps when the field is absent (backward compat)" {
+    const a = std.testing.allocator;
+    var parsed = (try parse(a, "image_id = 103\ngap_ms = 125\ntmux = 0\ntty = /dev/tty\nframe_sig = ff\nframe = /a/0.png\n")).?;
+    defer parsed.deinit();
+    try std.testing.expectEqual(default_max_fps, parsed.value.max_fps);
 }
 
 test "parse rejects non-absolute tty and frame paths" {
@@ -399,6 +450,7 @@ test "Locked: write then read round-trips through the state dir" {
     const m: Manifest = .{
         .image_id = 104,
         .gap_ms = 63,
+        .max_fps = 30,
         .tmux = false,
         .tty_path = abs_tty,
         .frames = &.{abs_frames},
