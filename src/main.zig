@@ -4,7 +4,8 @@ const statusline = @import("statusline.zig");
 const tier = @import("tier.zig");
 const kitty = @import("kitty.zig");
 const rows = @import("rows.zig");
-const cache = @import("cache.zig");
+const frames = @import("frames.zig");
+const state = @import("state.zig");
 
 const Io = std.Io;
 
@@ -34,16 +35,20 @@ pub fn main(init: std.process.Init) !void {
     // placeholder cell encodes the id via `38;5;<id>` (see kitty.placeholderGrid).
     const image_id: u32 = 100 + tier_idx;
 
-    const png_bytes = readFace(gpa, io, cfg, tier_idx);
-    defer if (png_bytes) |b| gpa.free(b);
+    const fps = config.effectiveFps(cfg, tier_idx);
+    const gap_ms = gapMs(fps);
+
+    var loaded = loadFrames(gpa, io, cfg, tier_idx);
+    defer if (loaded) |*l| l.deinit(gpa);
 
     const caps = detectCaps(environ);
 
     var dbg: std.ArrayList(u8) = .empty;
     defer dbg.deinit(gpa);
-    dbg.print(gpa, "tmux={} kitty_capable={} tmux_pane={s} png_len={?d} box_cols={d}\n", .{
+    dbg.print(gpa, "tmux={} kitty_capable={} tmux_pane={s} frames={?d} fps={d} gap_ms={d} box_cols={d}\n", .{
         caps.tmux,                      caps.kitty_capable,
-        caps.tmux_pane orelse "(null)", if (png_bytes) |b| b.len else null,
+        caps.tmux_pane orelse "(null)", if (loaded) |l| l.bytes.len else null,
+        fps,                            gap_ms,
         cfg.sprite.box_cols,
     }) catch {};
 
@@ -60,9 +65,12 @@ pub fn main(init: std.process.Init) !void {
     // and a non-graphics host simply drops them (best-effort, matches proto).
     const can_graphics = caps.kitty_capable or caps.tmux;
     dbg.print(gpa, "can_graphics={} image_id={d}\n", .{ can_graphics, image_id }) catch {};
-    if (can_graphics and png_bytes != null) {
-        const tmpdir = environ.getPosix("TMPDIR");
-        if (tryGraphics(gpa, io, caps, tmpdir, image_id, png_bytes.?, rows.line_count, cfg.sprite.box_cols, &dbg)) {
+    if (can_graphics and loaded != null) {
+        const env_paths: StateEnv = .{
+            .xdg_state_home = environ.getPosix("XDG_STATE_HOME"),
+            .home = environ.getPosix("HOME"),
+        };
+        if (tryGraphics(gpa, io, caps, env_paths, tier_idx, image_id, fps, gap_ms, loaded.?, rows.line_count, cfg.sprite.box_cols, &dbg)) {
             if (kitty.placeholderGrid(gpa, image_id, rows.line_count, cfg.sprite.box_cols) catch null) |g| {
                 grid = g;
                 var count: usize = 0;
@@ -102,23 +110,51 @@ fn readStdin(gpa: std.mem.Allocator, io: Io) ![]u8 {
     return fr.interface.allocRemaining(gpa, .limited(1 << 20));
 }
 
-/// Resolve and read the tier's face PNG. Any failure yields null (no sprite).
-fn readFace(gpa: std.mem.Allocator, io: Io, cfg: config.Config, tier_idx: u32) ?[]u8 {
-    var derived: ?[][]u8 = null;
-    defer if (derived) |d| config.freeFaces(gpa, d);
+/// Per-frame gap in milliseconds: round(1000 / fps). fps == 0 means a static
+/// tier and yields 0, which buildGraphicsPayload treats as "no animation".
+fn gapMs(fps: u32) u32 {
+    if (fps == 0) return 0;
+    return @intFromFloat(@round(1000.0 / @as(f64, @floatFromInt(fps))));
+}
 
-    const face_path: []const u8 = blk: {
-        if (cfg.sprite.faces) |faces| {
-            if (faces.len == 0) return null;
-            break :blk faces[@min(@as(usize, tier_idx), faces.len - 1)];
-        }
-        const d = config.deriveFaces(gpa, cfg.sprite.dir, cfg.sprite.tiers) catch return null;
-        derived = d;
-        if (d.len == 0) return null;
-        break :blk d[@min(@as(usize, tier_idx), d.len - 1)];
-    };
+/// The tier's frame contents plus the stat signature the refresh state gates on.
+const LoadedFrames = struct {
+    bytes: []const []const u8,
+    sig: u64,
 
-    return std.Io.Dir.cwd().readFileAlloc(io, face_path, gpa, .limited(1 << 20)) catch null;
+    fn deinit(self: *LoadedFrames, gpa: std.mem.Allocator) void {
+        for (self.bytes) |b| gpa.free(b);
+        gpa.free(self.bytes);
+    }
+};
+
+/// Resolve the tier's frames, then read and stat each one. Any failure yields
+/// null (no sprite) -- the same degradation as a missing face PNG today.
+fn loadFrames(gpa: std.mem.Allocator, io: Io, cfg: config.Config, tier_idx: u32) ?LoadedFrames {
+    const paths = (frames.resolveTierFrames(gpa, io, cfg, tier_idx) catch null) orelse return null;
+    defer frames.freeFrames(gpa, paths);
+
+    var bytes: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (bytes.items) |b| gpa.free(b);
+        bytes.deinit(gpa);
+    }
+    var stats: std.ArrayList(state.FrameStat) = .empty;
+    defer stats.deinit(gpa);
+
+    for (paths) |path| {
+        const st = std.Io.Dir.cwd().statFile(io, path, .{}) catch return null;
+        const b = std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(1 << 20)) catch return null;
+        bytes.append(gpa, b) catch {
+            gpa.free(b);
+            return null;
+        };
+        stats.append(gpa, .{ .size = st.size, .mtime = st.mtime.nanoseconds }) catch return null;
+    }
+
+    const sig = state.frameSignature(stats.items);
+    const owned = bytes.toOwnedSlice(gpa) catch return null;
+    return .{ .bytes = owned, .sig = sig };
 }
 
 const Caps = struct {
@@ -127,9 +163,17 @@ const Caps = struct {
     /// The `%N` pane this process belongs to (from $TMUX_PANE). Null outside
     /// tmux. Used to target `tmux display -t` at the correct pane's tty.
     tmux_pane: ?[]const u8,
-    /// $KITTY_WINDOW_ID verbatim; keys the transmit cache so a restarted kitty
-    /// (fresh image store, same /dev/tty ctime) doesn't hit a stale entry.
+    /// $KITTY_WINDOW_ID verbatim; keys the refresh state so distinct kitty
+    /// windows keep distinct records. It does NOT detect a restarted kitty
+    /// (ids restart from 1) — the state TTL bounds that staleness instead.
     kitty_window_id: ?[]const u8,
+};
+
+/// Environment inputs for state.resolveStatePath, threaded from main so
+/// tryGraphics stays free of direct environ reads.
+const StateEnv = struct {
+    xdg_state_home: ?[]const u8,
+    home: ?[]const u8,
 };
 
 fn detectCaps(environ: std.process.Environ) Caps {
@@ -162,18 +206,22 @@ fn detectCaps(environ: std.process.Environ) Caps {
     };
 }
 
-/// Open the graphics target and write delete/transmit/placement escapes,
-/// unless the transmit cache says this (tty, image_id, png) already landed --
-/// re-writing every refresh races Claude Code's own writes on the same tty
-/// (interleaving mid-DCS corrupts the terminal) and blinks the sprite.
+/// Open the graphics target and write the full escape sequence for the tier,
+/// unless the refresh state says this exact (tier, image id, fps, frames)
+/// already landed on this tty -- re-writing every refresh races Claude Code's
+/// own writes on the same tty (interleaving mid-DCS corrupts the terminal),
+/// blinks the sprite, and would restart the terminal-side animation loop.
 /// Returns true only if everything succeeded; any failure degrades to no sprite.
 fn tryGraphics(
     gpa: std.mem.Allocator,
     io: Io,
     caps: Caps,
-    tmpdir: ?[]const u8,
+    env_paths: StateEnv,
+    tier_idx: u32,
     image_id: u32,
-    png: []const u8,
+    fps: u32,
+    gap_ms: u32,
+    loaded: LoadedFrames,
     box_rows: u32,
     box_cols: u32,
     dbg: *std.ArrayList(u8),
@@ -203,32 +251,38 @@ fn tryGraphics(
         tty_path = out;
     }
 
-    // Cache setup is best-effort: any failure means "no caching", never "no
+    // State setup is best-effort: any failure means "no gating", never "no
     // sprite". The exclusive lock also serializes concurrent statusline
     // instances so their tty writes can't interleave.
-    const png_hash = std.hash.XxHash64.hash(0, png);
-    var locked: ?cache.Locked = null;
+    var locked: ?state.Locked = null;
     defer if (locked) |*l| l.close(io);
-    var tty_ctime: i96 = 0;
 
-    if (std.Io.Dir.cwd().statFile(io, tty_path, .{})) |st| {
-        tty_ctime = st.ctime.nanoseconds;
-        if (cache.statePath(gpa, tmpdir, tty_path, caps.kitty_window_id) catch null) |path| {
-            defer gpa.free(path);
-            locked = cache.Locked.open(io, path) catch null;
-        }
-    } else |e| {
-        dbg.print(gpa, "stat tty {s} failed: {} (cache bypassed)\n", .{ tty_path, e }) catch {};
+    const key = state.stateKey(tty_path, caps.kitty_window_id, caps.tmux_pane);
+    if (state.resolveStatePath(gpa, env_paths.xdg_state_home, env_paths.home, key) catch null) |path| {
+        defer gpa.free(path);
+        locked = state.Locked.open(io, path) catch null;
     }
 
+    const current: state.State = .{
+        .tier = tier_idx,
+        .image_id = image_id,
+        .fps = fps,
+        .frame_sig = loaded.sig,
+    };
+
     if (locked) |l| {
-        if (cache.isHit(l.state, tty_ctime, image_id, png_hash)) {
-            dbg.print(gpa, "cache=hit id={d}\n", .{image_id}) catch {};
+        // A hit must NOT touch the state file: its mtime marks the last
+        // transmit, so the TTL forces one retransmit ~10 min after that,
+        // bounding staleness from a restarted terminal whose image store is
+        // gone while the state still says "transmitted".
+        const now_ns = Io.Timestamp.now(io, .real).nanoseconds;
+        if (state.matches(l.state, current) and !state.isExpired(l.mtime_ns, now_ns)) {
+            dbg.print(gpa, "state=hit id={d}\n", .{image_id}) catch {};
             return true;
         }
-        dbg.print(gpa, "cache=miss id={d}\n", .{image_id}) catch {};
+        dbg.print(gpa, "state=miss id={d}\n", .{image_id}) catch {};
     } else {
-        dbg.print(gpa, "cache=bypass\n", .{}) catch {};
+        dbg.print(gpa, "state=bypass\n", .{}) catch {};
     }
 
     const tty = std.Io.Dir.openFileAbsolute(io, tty_path, .{ .mode = .write_only }) catch |e| {
@@ -237,7 +291,7 @@ fn tryGraphics(
     };
     defer tty.close(io);
 
-    buildAndWrite(gpa, io, tty, caps.tmux, image_id, png, box_rows, box_cols) catch |e| {
+    buildAndWrite(gpa, io, tty, caps.tmux, image_id, loaded.bytes, gap_ms, box_rows, box_cols) catch |e| {
         dbg.print(gpa, "buildAndWrite failed: {}\n", .{e}) catch {};
         return false;
     };
@@ -246,7 +300,7 @@ fn tryGraphics(
     // Only a confirmed write gets recorded; a failed commit just means a
     // redundant retransmit next frame.
     if (locked) |*l| {
-        cache.record(&l.state, tty_ctime, image_id, png_hash);
+        l.state = current;
         l.commit(gpa, io) catch {};
     }
     return true;
@@ -258,11 +312,12 @@ fn buildAndWrite(
     tty: std.Io.File,
     tmux: bool,
     image_id: u32,
-    png: []const u8,
+    frame_bytes: []const []const u8,
+    gap_ms: u32,
     box_rows: u32,
     box_cols: u32,
 ) !void {
-    const payload = try buildGraphicsPayload(gpa, tmux, image_id, &.{png}, 0, box_rows, box_cols);
+    const payload = try buildGraphicsPayload(gpa, tmux, image_id, frame_bytes, gap_ms, box_rows, box_cols);
     defer gpa.free(payload);
     try tty.writeStreamingAll(io, payload);
 }
@@ -276,13 +331,13 @@ pub fn buildGraphicsPayload(
     gpa: std.mem.Allocator,
     tmux: bool,
     image_id: u32,
-    frames: []const []const u8,
+    frame_bytes: []const []const u8,
     gap_ms: u32,
     box_rows: u32,
     box_cols: u32,
 ) ![]u8 {
-    std.debug.assert(frames.len >= 1);
-    const animated = frames.len > 1 and gap_ms > 0;
+    std.debug.assert(frame_bytes.len >= 1);
+    const animated = frame_bytes.len > 1 and gap_ms > 0;
 
     var payload: std.ArrayList(u8) = .empty;
     errdefer payload.deinit(gpa);
@@ -293,12 +348,12 @@ pub fn buildGraphicsPayload(
         try appendMaybeTmux(gpa, &payload, tmux, esc);
     }
     {
-        const esc = try kitty.transmit(gpa, image_id, frames[0], .{});
+        const esc = try kitty.transmit(gpa, image_id, frame_bytes[0], .{});
         defer gpa.free(esc);
         try appendMaybeTmux(gpa, &payload, tmux, esc);
     }
     if (animated) {
-        for (frames[1..]) |frame| {
+        for (frame_bytes[1..]) |frame| {
             const esc = try kitty.transmitFrame(gpa, image_id, gap_ms, frame, .{});
             defer gpa.free(esc);
             try appendMaybeTmux(gpa, &payload, tmux, esc);
@@ -345,8 +400,21 @@ test {
     _ = @import("kitty.zig");
     _ = @import("frames.zig");
     _ = @import("rows.zig");
-    _ = @import("cache.zig");
     _ = @import("state.zig");
+}
+
+test "gapMs: fps 0 means static and yields 0" {
+    try std.testing.expectEqual(@as(u32, 0), gapMs(0));
+}
+
+test "gapMs rounds 1000/fps to the nearest millisecond" {
+    try std.testing.expectEqual(@as(u32, 125), gapMs(8));
+    // 1000/16 = 62.5; @round rounds half away from zero.
+    try std.testing.expectEqual(@as(u32, 63), gapMs(16));
+    try std.testing.expectEqual(@as(u32, 33), gapMs(30));
+    try std.testing.expectEqual(@as(u32, 1000), gapMs(1));
+    // fps beyond 1000 rounds down to 0: no per-frame gap survives.
+    try std.testing.expectEqual(@as(u32, 0), gapMs(3000));
 }
 
 /// The pre-animation static sequence (delete + transmit + placement), built
@@ -477,11 +545,11 @@ test "buildGraphicsPayload: N frames yield exactly N-1 a=f escapes" {
 
 test "buildGraphicsPayload: tmux wraps every APC individually and nothing else" {
     const a = std.testing.allocator;
-    const frames: []const []const u8 = &.{ "F0", "F1", "F2" };
+    const frame_list: []const []const u8 = &.{ "F0", "F1", "F2" };
 
-    const wrapped = try buildGraphicsPayload(a, true, 103, frames, 125, 3, 6);
+    const wrapped = try buildGraphicsPayload(a, true, 103, frame_list, 125, 3, 6);
     defer a.free(wrapped);
-    const plain = try buildGraphicsPayload(a, false, 103, frames, 125, 3, 6);
+    const plain = try buildGraphicsPayload(a, false, 103, frame_list, 125, 3, 6);
     defer a.free(plain);
 
     var count: usize = 0;

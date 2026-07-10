@@ -2,17 +2,30 @@ const std = @import("std");
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
 
-/// What was last transmitted to a graphics target. `tty_ctime` fingerprints
-/// the pty node: a recreated pane/terminal gets a fresh ctime, so a mismatch
-/// forces a full re-transmit (strictly better than a TTL — no visible loop
-/// restart while the terminal lives).
+/// What was last transmitted to a graphics target. A terminal restart leaves
+/// stale state behind (the image store is gone but the file still says
+/// "transmitted") and nothing observable on the tty distinguishes that from a
+/// live placement, so staleness is bounded by a TTL on the state file's age
+/// instead: worst case is one visible retransmit (and animation-loop restart)
+/// per `ttl_ns` — see `isExpired`.
 pub const State = struct {
     tier: u32,
     image_id: u32,
     fps: u32,
     frame_sig: u64,
-    tty_ctime: i96,
 };
+
+/// How long a recorded transmit stays trusted. On a hit the file is left
+/// untouched, so its mtime marks the LAST TRANSMIT — the TTL fires ~10 min
+/// after that, not 10 min after the last refresh.
+pub const ttl_ns: i96 = 10 * std.time.ns_per_min;
+
+/// Whether a state file with mtime `file_mtime_ns` is too old to trust at
+/// `now_ns` (both epoch nanoseconds). Pure — callers pass the clock reading in.
+/// Zero and negative ages (mtime in the future, clock skew) count as fresh.
+pub fn isExpired(file_mtime_ns: i96, now_ns: i96) bool {
+    return now_ns - file_mtime_ns > ttl_ns;
+}
 
 pub const FrameStat = struct { size: u64, mtime: i96 };
 
@@ -85,7 +98,6 @@ pub fn parse(bytes: []const u8) ?State {
     var image_id: ?u32 = null;
     var fps: ?u32 = null;
     var frame_sig: ?u64 = null;
-    var tty_ctime: ?i96 = null;
 
     var it = std.mem.splitScalar(u8, bytes, '\n');
     while (it.next()) |raw_line| {
@@ -104,8 +116,6 @@ pub fn parse(bytes: []const u8) ?State {
             fps = std.fmt.parseInt(u32, rhs, 10) catch return null;
         } else if (std.mem.eql(u8, key, "frame_sig")) {
             frame_sig = std.fmt.parseInt(u64, rhs, 16) catch return null;
-        } else if (std.mem.eql(u8, key, "tty_ctime")) {
-            tty_ctime = std.fmt.parseInt(i96, rhs, 10) catch return null;
         }
         // Unknown keys are ignored, mirroring the config reader.
     }
@@ -115,7 +125,6 @@ pub fn parse(bytes: []const u8) ?State {
         .image_id = image_id orelse return null,
         .fps = fps orelse return null,
         .frame_sig = frame_sig orelse return null,
-        .tty_ctime = tty_ctime orelse return null,
     };
 }
 
@@ -123,8 +132,8 @@ pub fn parse(bytes: []const u8) ?State {
 pub fn serialize(allocator: Allocator, state: State) ![]u8 {
     return std.fmt.allocPrint(
         allocator,
-        "tier = {d}\nimage_id = {d}\nfps = {d}\nframe_sig = {x}\ntty_ctime = {d}\n",
-        .{ state.tier, state.image_id, state.fps, state.frame_sig, state.tty_ctime },
+        "tier = {d}\nimage_id = {d}\nfps = {d}\nframe_sig = {x}\n",
+        .{ state.tier, state.image_id, state.fps, state.frame_sig },
     );
 }
 
@@ -139,6 +148,9 @@ pub fn matches(recorded: ?State, current: State) bool {
 pub const Locked = struct {
     file: Io.File,
     state: ?State,
+    /// The state file's mtime (epoch ns) at open — i.e. when the recorded
+    /// transmit last happened. Feed to `isExpired` together with `state`.
+    mtime_ns: i96,
 
     pub fn open(io: Io, path: []const u8) !Locked {
         // Best-effort: the state directory may not exist on first run; a
@@ -154,9 +166,10 @@ pub const Locked = struct {
         });
         errdefer file.close(io);
 
+        const st = try file.stat(io);
         var buf: [4096]u8 = undefined;
         const n = try file.readPositionalAll(io, &buf, 0);
-        return .{ .file = file, .state = parse(buf[0..n]) };
+        return .{ .file = file, .state = parse(buf[0..n]), .mtime_ns = st.mtime.nanoseconds };
     }
 
     pub fn commit(self: *Locked, allocator: Allocator, io: Io) !void {
@@ -255,13 +268,21 @@ test "frameSignature changes on mtime, size, count, or order" {
     try std.testing.expect(frameSignature(&.{}) != frameSignature(base));
 }
 
+test "isExpired: fresh under the TTL, expired past it, tolerant of skew" {
+    const mtime: i96 = 1_700_000_000_000_000_000;
+    try std.testing.expect(!isExpired(mtime, mtime)); // zero age
+    try std.testing.expect(!isExpired(mtime, mtime + ttl_ns - 1)); // just under
+    try std.testing.expect(!isExpired(mtime, mtime + ttl_ns)); // exactly at
+    try std.testing.expect(isExpired(mtime, mtime + ttl_ns + 1)); // just over
+    try std.testing.expect(!isExpired(mtime, mtime - 1)); // negative age (skew)
+}
+
 test "serialize/parse round trip matches" {
     const s: State = .{
         .tier = 3,
         .image_id = 103,
         .fps = 8,
         .frame_sig = 0xdeadbeefcafe1234,
-        .tty_ctime = -1234567890123456789,
     };
     const bytes = try serialize(std.testing.allocator, s);
     defer std.testing.allocator.free(bytes);
@@ -272,7 +293,7 @@ test "serialize/parse round trip matches" {
 }
 
 test "matches is false when any field differs" {
-    const s: State = .{ .tier = 1, .image_id = 101, .fps = 8, .frame_sig = 0xff, .tty_ctime = 42 };
+    const s: State = .{ .tier = 1, .image_id = 101, .fps = 8, .frame_sig = 0xff };
 
     try std.testing.expect(matches(s, s));
 
@@ -288,13 +309,10 @@ test "matches is false when any field differs" {
     m = s;
     m.frame_sig = 0xfe;
     try std.testing.expect(!matches(m, s));
-    m = s;
-    m.tty_ctime = 43;
-    try std.testing.expect(!matches(m, s));
 }
 
 test "matches is false with no recorded state" {
-    const s: State = .{ .tier = 1, .image_id = 101, .fps = 8, .frame_sig = 0xff, .tty_ctime = 42 };
+    const s: State = .{ .tier = 1, .image_id = 101, .fps = 8, .frame_sig = 0xff };
     try std.testing.expect(!matches(null, s));
 }
 
@@ -302,11 +320,11 @@ test "parse tolerates missing, corrupt, or partial input" {
     try std.testing.expectEqual(@as(?State, null), parse(""));
     try std.testing.expectEqual(@as(?State, null), parse("total garbage\x00\xff\n"));
     try std.testing.expectEqual(@as(?State, null), parse("tier = 1\nimage_id = 101\n"));
-    try std.testing.expectEqual(@as(?State, null), parse("tier = notanumber\nimage_id = 101\nfps = 8\nframe_sig = ff\ntty_ctime = 42\n"));
+    try std.testing.expectEqual(@as(?State, null), parse("tier = notanumber\nimage_id = 101\nfps = 8\nframe_sig = ff\n"));
 }
 
 test "parse tolerates blank lines and stray whitespace" {
-    const s: State = .{ .tier = 1, .image_id = 101, .fps = 8, .frame_sig = 0xff, .tty_ctime = 42 };
+    const s: State = .{ .tier = 1, .image_id = 101, .fps = 8, .frame_sig = 0xff };
     const bytes = try serialize(std.testing.allocator, s);
     defer std.testing.allocator.free(bytes);
 
@@ -329,13 +347,16 @@ test "Locked: missing file opens with no state, commit round-trips" {
 
     var locked = try Locked.open(io, path);
     try std.testing.expectEqual(@as(?State, null), locked.state);
-    locked.state = .{ .tier = 2, .image_id = 102, .fps = 10, .frame_sig = 0xfeed, .tty_ctime = 9 };
+    locked.state = .{ .tier = 2, .image_id = 102, .fps = 10, .frame_sig = 0xfeed };
     try locked.commit(a, io);
     locked.close(io);
 
     var reopened = try Locked.open(io, path);
     defer reopened.close(io);
-    try std.testing.expect(matches(reopened.state, .{ .tier = 2, .image_id = 102, .fps = 10, .frame_sig = 0xfeed, .tty_ctime = 9 }));
+    try std.testing.expect(matches(reopened.state, .{ .tier = 2, .image_id = 102, .fps = 10, .frame_sig = 0xfeed }));
+    // The recorded mtime is a plausible epoch timestamp, usable with isExpired.
+    try std.testing.expect(reopened.mtime_ns > 0);
+    try std.testing.expect(!isExpired(reopened.mtime_ns, reopened.mtime_ns + 1));
 }
 
 test "Locked: open creates missing parent directories" {
@@ -389,13 +410,13 @@ test "Locked: commit shrinks a previously longer file" {
     {
         var locked = try Locked.open(io, path);
         defer locked.close(io);
-        locked.state = .{ .tier = 1, .image_id = 101, .fps = 8, .frame_sig = 1, .tty_ctime = 1 };
+        locked.state = .{ .tier = 1, .image_id = 101, .fps = 8, .frame_sig = 1 };
         try locked.commit(a, io);
     }
 
     var reopened = try Locked.open(io, path);
     defer reopened.close(io);
-    try std.testing.expect(matches(reopened.state, .{ .tier = 1, .image_id = 101, .fps = 8, .frame_sig = 1, .tty_ctime = 1 }));
+    try std.testing.expect(matches(reopened.state, .{ .tier = 1, .image_id = 101, .fps = 8, .frame_sig = 1 }));
 }
 
 test "Locked: second opener cannot take the lock" {
