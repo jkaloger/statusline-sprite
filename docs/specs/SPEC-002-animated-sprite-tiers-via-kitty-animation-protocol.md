@@ -1,7 +1,7 @@
 ---
 title: animated sprite tiers via kitty animation protocol
 type: spec
-status: draft
+status: in-progress
 author: Jack Kaloger
 date: 2026-07-10
 tags: []

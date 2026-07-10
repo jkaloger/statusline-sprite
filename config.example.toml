@@ -3,6 +3,9 @@ dir = "/path/to/test/sprites"
 tiers = 5
 scale_tokens = 200000
 box_cols = 6
+fps = 8                        # global frame rate for animated tiers (0 = static)
+tier_fps = [8, 8, 10, 12, 16]  # optional per-tier override, indexed by tier
+max_frames = 32                # sanity cap on frames per tier
 
 [line1]
 command = "STARSHIP_SHELL= starship prompt"
