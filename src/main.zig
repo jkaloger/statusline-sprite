@@ -304,6 +304,7 @@ test {
     _ = @import("statusline.zig");
     _ = @import("tier.zig");
     _ = @import("kitty.zig");
+    _ = @import("frames.zig");
     _ = @import("rows.zig");
     _ = @import("cache.zig");
 }
