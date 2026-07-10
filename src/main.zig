@@ -262,8 +262,30 @@ fn buildAndWrite(
     box_rows: u32,
     box_cols: u32,
 ) !void {
+    const payload = try buildGraphicsPayload(gpa, tmux, image_id, &.{png}, 0, box_rows, box_cols);
+    defer gpa.free(payload);
+    try tty.writeStreamingAll(io, payload);
+}
+
+/// Assemble the full graphics escape payload for one image id. A single frame
+/// or gap_ms == 0 yields the static sequence (delete -> transmit ->
+/// placement); otherwise the SPEC-002 animation order: delete -> a=t frame 0
+/// -> a=f frames 1..N-1 -> root gap -> run -> placement. With `tmux` set,
+/// every APC is individually passthrough-wrapped. Caller owns the result.
+pub fn buildGraphicsPayload(
+    gpa: std.mem.Allocator,
+    tmux: bool,
+    image_id: u32,
+    frames: []const []const u8,
+    gap_ms: u32,
+    box_rows: u32,
+    box_cols: u32,
+) ![]u8 {
+    std.debug.assert(frames.len >= 1);
+    const animated = frames.len > 1 and gap_ms > 0;
+
     var payload: std.ArrayList(u8) = .empty;
-    defer payload.deinit(gpa);
+    errdefer payload.deinit(gpa);
 
     {
         const esc = try kitty.delete(gpa, image_id);
@@ -271,9 +293,26 @@ fn buildAndWrite(
         try appendMaybeTmux(gpa, &payload, tmux, esc);
     }
     {
-        const esc = try kitty.transmit(gpa, image_id, png, .{});
+        const esc = try kitty.transmit(gpa, image_id, frames[0], .{});
         defer gpa.free(esc);
         try appendMaybeTmux(gpa, &payload, tmux, esc);
+    }
+    if (animated) {
+        for (frames[1..]) |frame| {
+            const esc = try kitty.transmitFrame(gpa, image_id, gap_ms, frame, .{});
+            defer gpa.free(esc);
+            try appendMaybeTmux(gpa, &payload, tmux, esc);
+        }
+        {
+            const esc = try kitty.setRootFrameGap(gpa, image_id, gap_ms);
+            defer gpa.free(esc);
+            try appendMaybeTmux(gpa, &payload, tmux, esc);
+        }
+        {
+            const esc = try kitty.runAnimation(gpa, image_id);
+            defer gpa.free(esc);
+            try appendMaybeTmux(gpa, &payload, tmux, esc);
+        }
     }
     {
         const esc = try kitty.virtualPlacement(gpa, image_id, box_rows, box_cols);
@@ -281,7 +320,7 @@ fn buildAndWrite(
         try appendMaybeTmux(gpa, &payload, tmux, esc);
     }
 
-    try tty.writeStreamingAll(io, payload.items);
+    return payload.toOwnedSlice(gpa);
 }
 
 fn appendMaybeTmux(
@@ -308,4 +347,156 @@ test {
     _ = @import("rows.zig");
     _ = @import("cache.zig");
     _ = @import("state.zig");
+}
+
+/// The pre-animation static sequence (delete + transmit + placement), built
+/// from the independently-tested kitty builders. The static path of
+/// buildGraphicsPayload must be byte-identical to this.
+fn staticSequence(
+    a: std.mem.Allocator,
+    image_id: u32,
+    png: []const u8,
+    box_rows: u32,
+    box_cols: u32,
+) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(a);
+    const del = try kitty.delete(a, image_id);
+    defer a.free(del);
+    try out.appendSlice(a, del);
+    const tr = try kitty.transmit(a, image_id, png, .{});
+    defer a.free(tr);
+    try out.appendSlice(a, tr);
+    const pl = try kitty.virtualPlacement(a, image_id, box_rows, box_cols);
+    defer a.free(pl);
+    try out.appendSlice(a, pl);
+    return out.toOwnedSlice(a);
+}
+
+/// Parse a byte stream that must consist ONLY of tmux passthrough units
+/// (`ESC Ptmux; <esc-doubled body> ESC \`). Returns the concatenated
+/// un-doubled bodies; errors on any bytes outside a wrapper or any bare ESC
+/// inside one.
+fn unwrapTmuxUnits(a: std.mem.Allocator, wrapped: []const u8, count_out: *usize) ![]u8 {
+    const prefix = "\x1bPtmux;";
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(a);
+    var count: usize = 0;
+    var i: usize = 0;
+    while (i < wrapped.len) {
+        if (!std.mem.startsWith(u8, wrapped[i..], prefix)) return error.BytesOutsideWrapper;
+        i += prefix.len;
+        count += 1;
+        while (true) {
+            if (i >= wrapped.len) return error.UnterminatedWrapper;
+            const b = wrapped[i];
+            if (b != 0x1b) {
+                try out.append(a, b);
+                i += 1;
+                continue;
+            }
+            if (i + 1 >= wrapped.len) return error.UnterminatedWrapper;
+            switch (wrapped[i + 1]) {
+                0x1b => {
+                    try out.append(a, 0x1b);
+                    i += 2;
+                },
+                '\\' => {
+                    i += 2;
+                    break;
+                },
+                else => return error.BareEscapeInWrapper,
+            }
+        }
+    }
+    count_out.* = count;
+    return out.toOwnedSlice(a);
+}
+
+test "buildGraphicsPayload: N=1 is byte-identical to the static sequence, no a=f/a=a" {
+    const a = std.testing.allocator;
+    const out = try buildGraphicsPayload(a, false, 103, &.{"F0"}, 125, 3, 6);
+    defer a.free(out);
+
+    const expected = try staticSequence(a, 103, "F0", 3, 6);
+    defer a.free(expected);
+    try std.testing.expectEqualSlices(u8, expected, out);
+
+    try std.testing.expect(std.mem.indexOf(u8, out, "a=f") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "a=a") == null);
+}
+
+test "buildGraphicsPayload: gap_ms=0 with N>1 is the static sequence for frame 0 only" {
+    const a = std.testing.allocator;
+    const out = try buildGraphicsPayload(a, false, 103, &.{ "F0", "F1", "F2" }, 0, 3, 6);
+    defer a.free(out);
+
+    const expected = try staticSequence(a, 103, "F0", 3, 6);
+    defer a.free(expected);
+    try std.testing.expectEqualSlices(u8, expected, out);
+    try std.testing.expect(std.mem.indexOf(u8, out, "a=f") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "a=a") == null);
+}
+
+test "buildGraphicsPayload: escape order for N=3 is delete, a=t, a=f, a=f, root gap, run, placement" {
+    const a = std.testing.allocator;
+    const out = try buildGraphicsPayload(a, false, 103, &.{ "F0", "F1", "F2" }, 125, 3, 6);
+    defer a.free(out);
+
+    const idx_delete = std.mem.indexOf(u8, out, "a=d,").?;
+    const idx_root = std.mem.indexOf(u8, out, "a=t,").?;
+    const idx_f1 = std.mem.indexOf(u8, out, "a=f,").?;
+    const idx_f2 = std.mem.indexOfPos(u8, out, idx_f1 + 1, "a=f,").?;
+    // setRootFrameGap is the only escape carrying r=1 (box_rows=3 keeps the
+    // placement's r= distinct); runAnimation the only one carrying s=3.
+    const idx_gap = std.mem.indexOf(u8, out, "r=1,").?;
+    const idx_run = std.mem.indexOf(u8, out, "s=3,").?;
+    const idx_place = std.mem.indexOf(u8, out, "a=p,").?;
+
+    try std.testing.expect(idx_delete < idx_root);
+    try std.testing.expect(idx_root < idx_f1);
+    try std.testing.expect(idx_f1 < idx_f2);
+    try std.testing.expect(idx_f2 < idx_gap);
+    try std.testing.expect(idx_gap < idx_run);
+    try std.testing.expect(idx_run < idx_place);
+
+    // gap_ms lands on every a=f and the root-gap escape
+    try std.testing.expectEqual(@as(usize, 3), std.mem.count(u8, out, "z=125"));
+}
+
+test "buildGraphicsPayload: N frames yield exactly N-1 a=f escapes" {
+    const a = std.testing.allocator;
+    // frames are tiny, so each a=f transmission is a single chunk and every
+    // a=f occurrence is a first chunk
+    const out = try buildGraphicsPayload(a, false, 103, &.{ "F0", "F1", "F2", "F3" }, 125, 3, 6);
+    defer a.free(out);
+
+    try std.testing.expectEqual(@as(usize, 3), std.mem.count(u8, out, "a=f"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, out, "a=t"));
+}
+
+test "buildGraphicsPayload: tmux wraps every APC individually and nothing else" {
+    const a = std.testing.allocator;
+    const frames: []const []const u8 = &.{ "F0", "F1", "F2" };
+
+    const wrapped = try buildGraphicsPayload(a, true, 103, frames, 125, 3, 6);
+    defer a.free(wrapped);
+    const plain = try buildGraphicsPayload(a, false, 103, frames, 125, 3, 6);
+    defer a.free(plain);
+
+    var count: usize = 0;
+    const unwrapped = try unwrapTmuxUnits(a, wrapped, &count);
+    defer a.free(unwrapped);
+
+    // delete + a=t + 2x a=f + root gap + run + placement
+    try std.testing.expectEqual(@as(usize, 7), count);
+    try std.testing.expectEqual(@as(usize, 7), std.mem.count(u8, wrapped, "\x1bPtmux;"));
+    try std.testing.expectEqualSlices(u8, plain, unwrapped);
+
+    // any \x1b_G must be the doubled-ESC form inside a wrapper
+    var pos: usize = 0;
+    while (std.mem.indexOfPos(u8, wrapped, pos, "\x1b_G")) |i| {
+        try std.testing.expect(i > 0 and wrapped[i - 1] == 0x1b);
+        pos = i + 1;
+    }
 }
