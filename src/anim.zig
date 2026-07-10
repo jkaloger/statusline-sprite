@@ -40,6 +40,37 @@ pub fn heartbeatPath(allocator: Allocator, xdg_state_home: ?[]const u8, home: ?[
     return statePathNamed(allocator, xdg_state_home, home, "heartbeat", key);
 }
 
+/// `daemon-<key hex>.lock` alongside the manifest — the singleton lock for one
+/// animator daemon per graphics target. The statusline's `ensureDaemon` probes
+/// this via (xdg, home, key); the daemon, which only receives its manifest path
+/// on argv, re-derives the identical path with `daemonLockPathFromManifest`.
+/// Caller owns the result.
+pub fn daemonLockPath(allocator: Allocator, xdg_state_home: ?[]const u8, home: ?[]const u8, key: u64) ![]u8 {
+    if (xdg_state_home) |xdg| {
+        if (xdg.len != 0)
+            return std.fmt.allocPrint(allocator, "{s}/statusline-sprite/daemon-{x:0>16}.lock", .{ xdg, key });
+    }
+    if (home) |h| {
+        if (h.len != 0)
+            return std.fmt.allocPrint(allocator, "{s}/.local/state/statusline-sprite/daemon-{x:0>16}.lock", .{ h, key });
+    }
+    return error.NoStateDir;
+}
+
+/// Re-derive the daemon lock path from a manifest path produced by
+/// `manifestPath`: swap the `anim-` basename prefix for `daemon-` and append
+/// `.lock`, keeping the same directory. Byte-identical to `daemonLockPath` for
+/// the same key, so the daemon and the statusline probe the same file without
+/// the daemon re-computing the key. Errors if the path is not an `anim-` file.
+/// Caller owns the result.
+pub fn daemonLockPathFromManifest(allocator: Allocator, manifest_path: []const u8) ![]u8 {
+    const dir = std.fs.path.dirname(manifest_path) orelse return error.BadManifestPath;
+    const base = std.fs.path.basename(manifest_path);
+    if (!std.mem.startsWith(u8, base, "anim-")) return error.BadManifestPath;
+    const suffix = base["anim-".len..];
+    return std.fmt.allocPrint(allocator, "{s}/daemon-{s}.lock", .{ dir, suffix });
+}
+
 fn statePathNamed(allocator: Allocator, xdg_state_home: ?[]const u8, home: ?[]const u8, comptime prefix: []const u8, key: u64) ![]u8 {
     if (xdg_state_home) |xdg| {
         if (xdg.len != 0)
@@ -316,6 +347,38 @@ test "manifestPath and heartbeatPath sit alongside state-<key>" {
     try std.testing.expectEqualStrings("/home/me/.local/state/statusline-sprite/heartbeat-0000000000000abc", hp);
 
     try std.testing.expectError(error.NoStateDir, manifestPath(a, null, null, 1));
+}
+
+test "daemonLockPath sits alongside anim-<key> with a .lock suffix" {
+    const a = std.testing.allocator;
+    const lp = try daemonLockPath(a, "/xdg-state", "/home/me", 0xabc);
+    defer a.free(lp);
+    try std.testing.expectEqualStrings("/xdg-state/statusline-sprite/daemon-0000000000000abc.lock", lp);
+
+    const lp2 = try daemonLockPath(a, null, "/home/me", 0xabc);
+    defer a.free(lp2);
+    try std.testing.expectEqualStrings("/home/me/.local/state/statusline-sprite/daemon-0000000000000abc.lock", lp2);
+
+    try std.testing.expectError(error.NoStateDir, daemonLockPath(a, null, null, 1));
+}
+
+test "daemonLockPathFromManifest agrees byte-for-byte with daemonLockPath" {
+    const a = std.testing.allocator;
+    const mp = try manifestPath(a, "/xdg-state", "/home/me", 0xabc);
+    defer a.free(mp);
+
+    const from_manifest = try daemonLockPathFromManifest(a, mp);
+    defer a.free(from_manifest);
+    const from_key = try daemonLockPath(a, "/xdg-state", "/home/me", 0xabc);
+    defer a.free(from_key);
+
+    try std.testing.expectEqualStrings(from_key, from_manifest);
+}
+
+test "daemonLockPathFromManifest rejects a non-anim path" {
+    const a = std.testing.allocator;
+    try std.testing.expectError(error.BadManifestPath, daemonLockPathFromManifest(a, "/tmp/state-0000000000000abc"));
+    try std.testing.expectError(error.BadManifestPath, daemonLockPathFromManifest(a, "anim-abc"));
 }
 
 test "Locked: write then read round-trips through the state dir" {

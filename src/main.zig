@@ -6,6 +6,8 @@ const kitty = @import("kitty.zig");
 const rows = @import("rows.zig");
 const frames = @import("frames.zig");
 const state = @import("state.zig");
+const anim = @import("anim.zig");
+const daemon = @import("daemon.zig");
 
 const Io = std.Io;
 
@@ -13,6 +15,12 @@ pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
     const io = init.io;
     const environ = init.minimal.environ;
+
+    switch (daemon.classify(collectArgv(init.arena.allocator(), init.minimal.args))) {
+        .animate => |manifest_path| return daemon.run(gpa, io, manifest_path),
+        .ensure => |manifest_path| return ensureDaemonMain(gpa, io, manifest_path),
+        .normal => {},
+    }
 
     const stdin_bytes = readStdin(gpa, io) catch &.{};
     defer gpa.free(stdin_bytes);
@@ -109,6 +117,32 @@ pub fn main(init: std.process.Init) !void {
             defer f_mut.close(io);
             f_mut.writeStreamingAll(io, dbg.items) catch {};
         } else |_| {}
+    }
+}
+
+/// Collect argv into a slice backed by `arena` (whole-process lifetime), so the
+/// pure `daemon.classify` can scan it. On POSIX the arg bytes point into the OS
+/// argv and outlive the process anyway.
+fn collectArgv(arena: std.mem.Allocator, args: std.process.Args) []const []const u8 {
+    var list: std.ArrayList([]const u8) = .empty;
+    var it = args.iterate();
+    while (it.next()) |arg| list.append(arena, arg) catch break;
+    return list.toOwnedSlice(arena) catch &.{};
+}
+
+/// `--ensure-daemon <manifest>` handler: run the ensure-check once and print the
+/// spawned daemon's pid (nothing if a daemon was already running). A hook for
+/// the integration harness to exercise `ensureDaemon` from a real parent that
+/// then exits, proving detachment.
+fn ensureDaemonMain(gpa: std.mem.Allocator, io: Io, manifest_path: []const u8) !void {
+    const lock_path = anim.daemonLockPathFromManifest(gpa, manifest_path) catch return;
+    defer gpa.free(lock_path);
+
+    const pid = daemon.ensureDaemon(gpa, io, lock_path, manifest_path) catch return;
+    if (pid) |p| {
+        var buf: [32]u8 = undefined;
+        const s = std.fmt.bufPrint(&buf, "{d}\n", .{p}) catch return;
+        std.Io.File.stdout().writeStreamingAll(io, s) catch {};
     }
 }
 
@@ -410,6 +444,7 @@ test {
     _ = @import("rows.zig");
     _ = @import("state.zig");
     _ = @import("anim.zig");
+    _ = @import("daemon.zig");
 }
 
 test "gapMs: fps 0 means static and yields 0" {
