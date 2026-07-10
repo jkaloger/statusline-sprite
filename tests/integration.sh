@@ -60,6 +60,44 @@ mtime_of() {
     stat -f %m "$1" 2>/dev/null || stat -c %Y "$1"
 }
 
+# Count non-overlapping occurrences of a fixed pattern in a (binary) file.
+count_pat() { grep -a -o -F -- "$2" "$1" 2>/dev/null | wc -l | tr -d ' '; }
+
+# The dir where a target's state-/anim-/heartbeat-/daemon- files live.
+state_dir() { echo "$1/statusline-sprite"; }
+anim_manifest() { ls "$1"/anim-* 2>/dev/null | head -n1; }
+heartbeat_file() { ls "$1"/heartbeat-* 2>/dev/null | head -n1; }
+
+# Prove a daemon is live: after the statusline has exited, only the daemon writes
+# to the tty, and it emits bare `a=t` on its timer. Poll for the count to grow
+# (up to ~4s). ps/pgrep are sandbox-blocked, so liveness is inferred from writes.
+prove_daemon_alive() {
+    local file="$1" c0 c1 i
+    c0="$(count_pat "$file" 'a=t')"
+    for ((i = 0; i < 40; i++)); do
+        sleep 0.1
+        c1="$(count_pat "$file" 'a=t')"
+        [ "$c1" -gt "$c0" ] && return 0
+    done
+    return 1
+}
+
+# Reap a target's daemon(s): remove the manifest (the daemon's deterministic
+# stop) and wait until tty writes cease (a=t count stable across one interval),
+# so no daemon is left running unbounded and later byte counts are stable.
+reap_daemon() {
+    local state="$1" file="$2" prev cur i
+    rm -f "$state"/anim-* 2>/dev/null
+    prev=""
+    for ((i = 0; i < 40; i++)); do
+        cur="$(count_pat "$file" 'a=t')"
+        [ "$cur" = "$prev" ] && return 0
+        prev="$cur"
+        sleep 0.25
+    done
+    return 0
+}
+
 # Fixtures shared by the graphics cases: an animated face directory (three
 # frames) built from the repo's test sprites, and the fake tmux shim.
 mkdir -p "$WORK/sprites/anim" "$WORK/bin"
@@ -138,58 +176,102 @@ printf '%s' "$SAMPLE_JSON" | run_binary TERM=xterm-kitty HOME="$WORK/home7" XDG_
 assert_three_lines "$WORK/out7" "case 7"
 echo "  ok: empty face dir yields 3 lines, no sprite"
 
-echo "== case 8: animated tier via fake tmux tty -- transmit once, then state-gated =="
+echo "== case 8: animated tier via fake tmux -- static frame 0 + daemon, state-gated =="
+# SPEC-007: an animated tier transmits frame 0 as the STATIC sequence (a=d/a=t/a=p,
+# never a=f/a=a) and hands motion to a resident daemon that cycles frames with
+# bare a=t. The daemon writes to the SAME fake tty, so byte assertions isolate the
+# statusline's transmit by its a=p/a=d markers (the daemon emits neither) and take
+# an immediate snapshot before the daemon can clobber frame-0 bytes. Every daemon
+# is reaped between runs so none runs unbounded and later counts stay stable.
 mkdir -p "$WORK/xdg8/statusline-sprite"
 cat > "$WORK/xdg8/statusline-sprite/config.toml" <<EOF
 [sprite]
 faces = ["$WORK/sprites/anim"]
 EOF
 TTY8="$WORK/tty8"
+STATE8="$(state_dir "$WORK/state8")"
 : > "$TTY8"
 
-# Run 1: full animated transmission must land on the graphics target.
+# Run 1 (state miss): static frame-0 transmit + manifest + heartbeat + daemon.
 printf '%s' "$SAMPLE_JSON" | run_tmux "$TTY8" HOME="$WORK/home8" XDG_CONFIG_HOME="$WORK/xdg8" XDG_STATE_HOME="$WORK/state8" > "$WORK/out8a" || fail "case 8 run 1: non-zero exit ($?)"
+cp "$TTY8" "$WORK/snap8a"   # snapshot before the daemon clobbers frame-0 bytes
 assert_three_lines "$WORK/out8a" "case 8 run 1"
 [ -s "$TTY8" ] || fail "case 8 run 1: no graphics bytes reached the fake tty"
-grep -aq 'a=t,' "$TTY8" || fail "case 8 run 1: missing a=t root transmission"
-grep -aq 'a=f,' "$TTY8" || fail "case 8 run 1: missing a=f frame transmission"
-grep -aq 'a=a,' "$TTY8" || fail "case 8 run 1: missing a=a animation control"
-grep -aq 'i=103' "$TTY8" || fail "case 8 run 1: expected image id 103 for tier 3"
-echo "  ok: first run transmitted animation escapes (a=t/a=f/a=a, i=103)"
+grep -aq 'a=d,' "$WORK/snap8a" || fail "case 8 run 1: missing a=d delete"
+grep -aq 'a=t,' "$WORK/snap8a" || fail "case 8 run 1: missing a=t transmission"
+grep -aq 'a=p,' "$WORK/snap8a" || fail "case 8 run 1: missing a=p placement"
+grep -aq 'i=103' "$WORK/snap8a" || fail "case 8 run 1: expected image id 103 for tier 3"
+# Retired kitty-animation escapes must NEVER appear (neither statusline nor daemon).
+grep -aq 'a=f,' "$TTY8" && fail "case 8 run 1: a=f must never be emitted"
+grep -aq 'a=a,' "$TTY8" && fail "case 8 run 1: a=a must never be emitted"
+# Manifest exists with ABSOLUTE frame paths and the tier's image id.
+MAN8="$(anim_manifest "$STATE8")"
+[ -n "$MAN8" ] && [ -f "$MAN8" ] || fail "case 8 run 1: no manifest written"
+grep -q '^frame = /' "$MAN8" || fail "case 8 run 1: manifest frame paths are not absolute"
+grep -q '^image_id = 103' "$MAN8" || fail "case 8 run 1: manifest image_id is not 103"
+# Heartbeat exists.
+HB8="$(heartbeat_file "$STATE8")"
+[ -n "$HB8" ] && [ -f "$HB8" ] || fail "case 8 run 1: no heartbeat written"
+# A daemon was spawned: bare a=t keeps landing after the statusline exited.
+prove_daemon_alive "$TTY8" || fail "case 8 run 1: no live daemon transmitting after statusline exit"
+echo "  ok: static frame 0 (a=d/a=t/a=p, i=103, no a=f/a=a), manifest+heartbeat, live daemon"
 
-# Run 2: unchanged inputs must write ZERO graphics bytes (state hit). The
-# 1s sleep makes any rewrite visible in the file's second-granularity mtime.
-sleep 1
-M8_BEFORE="$(mtime_of "$TTY8")"
+reap_daemon "$STATE8" "$TTY8"
+
+# Run 2 (state hit): heartbeat mtime advances, but NO new frame-0 transmit.
+# a=p/a=d are emitted ONLY by the statusline, so their counts detect a transmit
+# even with the daemon in the file; the snapshot is taken before run-2's daemon writes.
+AP8_BEFORE="$(count_pat "$TTY8" 'a=p')"
+AD8_BEFORE="$(count_pat "$TTY8" 'a=d')"
+sleep 1                     # 1s so a heartbeat rewrite shows at second granularity
+HB8_BEFORE="$(mtime_of "$HB8")"
 printf '%s' "$SAMPLE_JSON" | run_tmux "$TTY8" HOME="$WORK/home8" XDG_CONFIG_HOME="$WORK/xdg8" XDG_STATE_HOME="$WORK/state8" > "$WORK/out8b" || fail "case 8 run 2: non-zero exit ($?)"
+cp "$TTY8" "$WORK/snap8b"   # snapshot before run-2's daemon writes
 assert_three_lines "$WORK/out8b" "case 8 run 2"
-M8_AFTER="$(mtime_of "$TTY8")"
-[ "$M8_BEFORE" = "$M8_AFTER" ] || fail "case 8 run 2: graphics target was rewritten on an unchanged refresh"
-echo "  ok: second run wrote zero graphics bytes (state hit)"
+AP8_AFTER="$(count_pat "$WORK/snap8b" 'a=p')"
+AD8_AFTER="$(count_pat "$WORK/snap8b" 'a=d')"
+[ "$AP8_AFTER" = "$AP8_BEFORE" ] || fail "case 8 run 2: state hit re-transmitted (a=p $AP8_BEFORE -> $AP8_AFTER)"
+[ "$AD8_AFTER" = "$AD8_BEFORE" ] || fail "case 8 run 2: state hit re-transmitted (a=d $AD8_BEFORE -> $AD8_AFTER)"
+HB8_AFTER="$(mtime_of "$HB8")"
+[ "$HB8_AFTER" != "$HB8_BEFORE" ] || fail "case 8 run 2: heartbeat not touched on the state-hit path"
+echo "  ok: state hit touched the heartbeat but emitted no new frame-0 transmit"
 
-# Run 3: tier change (0 tokens -> tier 0) must re-transmit under image id 100.
+reap_daemon "$STATE8" "$TTY8"
+
+# Run 3: tier change (0 tokens -> tier 0) re-transmits under image id 100.
 printf '%s' "$LOW_JSON" | run_tmux "$TTY8" HOME="$WORK/home8" XDG_CONFIG_HOME="$WORK/xdg8" XDG_STATE_HOME="$WORK/state8" > "$WORK/out8c" || fail "case 8 run 3: non-zero exit ($?)"
+cp "$TTY8" "$WORK/snap8c"
 assert_three_lines "$WORK/out8c" "case 8 run 3"
-grep -aq 'i=100' "$TTY8" || fail "case 8 run 3: tier change did not re-transmit under image id 100"
+grep -aq 'i=100' "$WORK/snap8c" || fail "case 8 run 3: tier change did not re-transmit under image id 100"
 echo "  ok: tier change re-transmitted under the new image id"
 
-echo "== case 9: single-PNG tier via fake tmux tty -- static escapes only, state-gated =="
+reap_daemon "$STATE8" "$TTY8"
+
+echo "== case 9: single-PNG tier via fake tmux -- static only, no daemon, state-gated =="
 mkdir -p "$WORK/xdg9/statusline-sprite"
 cat > "$WORK/xdg9/statusline-sprite/config.toml" <<EOF
 [sprite]
 faces = ["$REPO_ROOT/test-sprites/face2.png"]
 EOF
 TTY9="$WORK/tty9"
+STATE9="$(state_dir "$WORK/state9")"
 : > "$TTY9"
 
 printf '%s' "$SAMPLE_JSON" | run_tmux "$TTY9" HOME="$WORK/home9" XDG_CONFIG_HOME="$WORK/xdg9" XDG_STATE_HOME="$WORK/state9" > "$WORK/out9a" || fail "case 9 run 1: non-zero exit ($?)"
 assert_three_lines "$WORK/out9a" "case 9 run 1"
 [ -s "$TTY9" ] || fail "case 9 run 1: no graphics bytes reached the fake tty"
+grep -aq 'a=d,' "$TTY9" || fail "case 9 run 1: missing a=d delete"
 grep -aq 'a=t,' "$TTY9" || fail "case 9 run 1: missing a=t transmission"
 grep -aq 'a=p,' "$TTY9" || fail "case 9 run 1: missing a=p placement"
 grep -aq 'a=f,' "$TTY9" && fail "case 9 run 1: single-PNG tier must not emit a=f"
 grep -aq 'a=a,' "$TTY9" && fail "case 9 run 1: single-PNG tier must not emit a=a"
-echo "  ok: single-PNG tier emitted static escapes only"
+# Static tier: no daemon machinery at all.
+[ -z "$(anim_manifest "$STATE9")" ] || fail "case 9: static tier wrote a manifest"
+[ -z "$(heartbeat_file "$STATE9")" ] || fail "case 9: static tier wrote a heartbeat"
+C9="$(count_pat "$TTY9" 'a=t')"
+sleep 0.6
+[ "$(count_pat "$TTY9" 'a=t')" = "$C9" ] || fail "case 9: a daemon is transmitting for a static tier"
+echo "  ok: single-PNG tier emitted static escapes only, spawned no daemon"
 
 sleep 1
 M9_BEFORE="$(mtime_of "$TTY9")"
@@ -197,7 +279,39 @@ printf '%s' "$SAMPLE_JSON" | run_tmux "$TTY9" HOME="$WORK/home9" XDG_CONFIG_HOME
 assert_three_lines "$WORK/out9b" "case 9 run 2"
 M9_AFTER="$(mtime_of "$TTY9")"
 [ "$M9_BEFORE" = "$M9_AFTER" ] || fail "case 9 run 2: static tier was re-transmitted on an unchanged refresh"
-echo "  ok: second run wrote zero graphics bytes (state gates static tiers too)"
+echo "  ok: second run wrote zero graphics bytes (no daemon; state gates static tiers)"
+
+echo "== case 10: animate=false on an animated dir -- static frame 0 only, no daemon =="
+mkdir -p "$WORK/xdg10/statusline-sprite"
+cat > "$WORK/xdg10/statusline-sprite/config.toml" <<EOF
+[sprite]
+faces = ["$WORK/sprites/anim"]
+animate = false
+EOF
+TTY10="$WORK/tty10"
+STATE10="$(state_dir "$WORK/state10")"
+: > "$TTY10"
+
+printf '%s' "$SAMPLE_JSON" | run_tmux "$TTY10" HOME="$WORK/home10" XDG_CONFIG_HOME="$WORK/xdg10" XDG_STATE_HOME="$WORK/state10" > "$WORK/out10" || fail "case 10: non-zero exit ($?)"
+assert_three_lines "$WORK/out10" "case 10"
+[ -s "$TTY10" ] || fail "case 10: no graphics bytes reached the fake tty"
+grep -aq 'a=t,' "$TTY10" || fail "case 10: missing a=t transmission"
+grep -aq 'a=p,' "$TTY10" || fail "case 10: missing a=p placement"
+grep -aq 'a=f,' "$TTY10" && fail "case 10: animate=false must not emit a=f"
+grep -aq 'a=a,' "$TTY10" && fail "case 10: animate=false must not emit a=a"
+[ -z "$(anim_manifest "$STATE10")" ] || fail "case 10: animate=false wrote a manifest"
+[ -z "$(heartbeat_file "$STATE10")" ] || fail "case 10: animate=false wrote a heartbeat"
+C10="$(count_pat "$TTY10" 'a=t')"
+sleep 0.6
+[ "$(count_pat "$TTY10" 'a=t')" = "$C10" ] || fail "case 10: a daemon is transmitting despite animate=false"
+echo "  ok: animate=false rendered static frame 0, spawned no daemon"
+
+echo "== teardown: reap any daemons; none should remain =="
+# Every animated run above was reaped inline (manifest removed -> daemon exits);
+# a final sweep guards against a straggler, and WORK removal on EXIT covers any
+# daemon still mid-sleep (its manifest is gone, so its next tick exits).
+reap_daemon "$STATE8" "$TTY8"
+echo "  ok: daemons reaped via manifest removal (ps/pgrep are sandbox-blocked)"
 
 echo "ALL INTEGRATION ASSERTIONS PASSED"
 exit 0
