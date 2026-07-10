@@ -307,4 +307,5 @@ test {
     _ = @import("frames.zig");
     _ = @import("rows.zig");
     _ = @import("cache.zig");
+    _ = @import("state.zig");
 }
