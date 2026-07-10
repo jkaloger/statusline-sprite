@@ -4,6 +4,7 @@ const statusline = @import("statusline.zig");
 const tier = @import("tier.zig");
 const kitty = @import("kitty.zig");
 const rows = @import("rows.zig");
+const cache = @import("cache.zig");
 
 const Io = std.Io;
 
@@ -60,7 +61,8 @@ pub fn main(init: std.process.Init) !void {
     const can_graphics = caps.kitty_capable or caps.tmux;
     dbg.print(gpa, "can_graphics={} image_id={d}\n", .{ can_graphics, image_id }) catch {};
     if (can_graphics and png_bytes != null) {
-        if (tryGraphics(gpa, io, caps, image_id, png_bytes.?, rows.line_count, cfg.sprite.box_cols, &dbg)) {
+        const tmpdir = environ.getPosix("TMPDIR");
+        if (tryGraphics(gpa, io, caps, tmpdir, image_id, png_bytes.?, rows.line_count, cfg.sprite.box_cols, &dbg)) {
             if (kitty.placeholderGrid(gpa, image_id, rows.line_count, cfg.sprite.box_cols) catch null) |g| {
                 grid = g;
                 var count: usize = 0;
@@ -125,6 +127,9 @@ const Caps = struct {
     /// The `%N` pane this process belongs to (from $TMUX_PANE). Null outside
     /// tmux. Used to target `tmux display -t` at the correct pane's tty.
     tmux_pane: ?[]const u8,
+    /// $KITTY_WINDOW_ID verbatim; keys the transmit cache so a restarted kitty
+    /// (fresh image store, same /dev/tty ctime) doesn't hit a stale entry.
+    kitty_window_id: ?[]const u8,
 };
 
 fn detectCaps(environ: std.process.Environ) Caps {
@@ -149,15 +154,24 @@ fn detectCaps(environ: std.process.Environ) Caps {
     }
 
     const pane = if (tmux_pane) |p| (if (p.len > 0) p else null) else null;
-    return .{ .tmux = is_tmux, .kitty_capable = capable, .tmux_pane = pane };
+    return .{
+        .tmux = is_tmux,
+        .kitty_capable = capable,
+        .tmux_pane = pane,
+        .kitty_window_id = kitty_win,
+    };
 }
 
-/// Open the graphics target and write delete/transmit/placement escapes.
+/// Open the graphics target and write delete/transmit/placement escapes,
+/// unless the transmit cache says this (tty, image_id, png) already landed --
+/// re-writing every refresh races Claude Code's own writes on the same tty
+/// (interleaving mid-DCS corrupts the terminal) and blinks the sprite.
 /// Returns true only if everything succeeded; any failure degrades to no sprite.
 fn tryGraphics(
     gpa: std.mem.Allocator,
     io: Io,
     caps: Caps,
+    tmpdir: ?[]const u8,
     image_id: u32,
     png: []const u8,
     box_rows: u32,
@@ -189,6 +203,34 @@ fn tryGraphics(
         tty_path = out;
     }
 
+    // Cache setup is best-effort: any failure means "no caching", never "no
+    // sprite". The exclusive lock also serializes concurrent statusline
+    // instances so their tty writes can't interleave.
+    const png_hash = std.hash.XxHash64.hash(0, png);
+    var locked: ?cache.Locked = null;
+    defer if (locked) |*l| l.close(io);
+    var tty_ctime: i96 = 0;
+
+    if (std.Io.Dir.cwd().statFile(io, tty_path, .{})) |st| {
+        tty_ctime = st.ctime.nanoseconds;
+        if (cache.statePath(gpa, tmpdir, tty_path, caps.kitty_window_id) catch null) |path| {
+            defer gpa.free(path);
+            locked = cache.Locked.open(io, path) catch null;
+        }
+    } else |e| {
+        dbg.print(gpa, "stat tty {s} failed: {} (cache bypassed)\n", .{ tty_path, e }) catch {};
+    }
+
+    if (locked) |l| {
+        if (cache.isHit(l.state, tty_ctime, image_id, png_hash)) {
+            dbg.print(gpa, "cache=hit id={d}\n", .{image_id}) catch {};
+            return true;
+        }
+        dbg.print(gpa, "cache=miss id={d}\n", .{image_id}) catch {};
+    } else {
+        dbg.print(gpa, "cache=bypass\n", .{}) catch {};
+    }
+
     const tty = std.Io.Dir.openFileAbsolute(io, tty_path, .{ .mode = .write_only }) catch |e| {
         dbg.print(gpa, "open tty {s} failed: {}\n", .{ tty_path, e }) catch {};
         return false;
@@ -200,6 +242,13 @@ fn tryGraphics(
         return false;
     };
     dbg.print(gpa, "graphics written to {s}\n", .{tty_path}) catch {};
+
+    // Only a confirmed write gets recorded; a failed commit just means a
+    // redundant retransmit next frame.
+    if (locked) |*l| {
+        cache.record(&l.state, tty_ctime, image_id, png_hash);
+        l.commit(gpa, io) catch {};
+    }
     return true;
 }
 
@@ -256,4 +305,5 @@ test {
     _ = @import("tier.zig");
     _ = @import("kitty.zig");
     _ = @import("rows.zig");
+    _ = @import("cache.zig");
 }
