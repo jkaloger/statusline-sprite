@@ -1,7 +1,7 @@
 ---
 title: client-side animated sprites via background animator daemon
 type: spec
-status: in-progress
+status: complete
 author: Jack Kaloger
 date: 2026-07-10
 tags: []
