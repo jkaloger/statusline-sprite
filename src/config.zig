@@ -14,6 +14,15 @@ pub const Sprite = struct {
     tier_fps: ?[]const u32,
     /// Cap on frames read per tier.
     max_frames: u32,
+    /// Master animation switch. When false, render a static frame 0 and never
+    /// spawn the animator daemon.
+    animate: bool,
+    /// Upper bound on the daemon's effective fps, so per-tier rates can't drive
+    /// the tty write frequency past this cap.
+    max_fps: u32,
+    /// How long the daemon tolerates a stale heartbeat before exiting, in
+    /// milliseconds.
+    daemon_ttl_ms: u32,
 };
 
 pub const Line = struct {
@@ -55,6 +64,9 @@ pub fn defaults() Config {
             .fps = 8,
             .tier_fps = null,
             .max_frames = 32,
+            .animate = true,
+            .max_fps = 30,
+            .daemon_ttl_ms = 5000,
         },
         .line1 = .{ .command = null },
         .line2 = .{ .color = null },
@@ -154,6 +166,12 @@ fn applyKey(a: Allocator, cfg: *Config, table: []const u8, key: []const u8, rhs:
             if (try parseIntArray(u32, a, rhs)) |v| cfg.sprite.tier_fps = v;
         } else if (std.mem.eql(u8, key, "max_frames")) {
             if (parseInt(u32, rhs)) |v| cfg.sprite.max_frames = v;
+        } else if (std.mem.eql(u8, key, "animate")) {
+            if (parseBool(rhs)) |v| cfg.sprite.animate = v;
+        } else if (std.mem.eql(u8, key, "max_fps")) {
+            if (parseInt(u32, rhs)) |v| cfg.sprite.max_fps = v;
+        } else if (std.mem.eql(u8, key, "daemon_ttl_ms")) {
+            if (parseInt(u32, rhs)) |v| cfg.sprite.daemon_ttl_ms = v;
         }
     } else if (std.mem.eql(u8, table, "line1")) {
         if (std.mem.eql(u8, key, "command")) {
@@ -184,6 +202,16 @@ fn parseInt(comptime T: type, rhs: []const u8) ?T {
     const hash = std.mem.indexOfScalar(u8, rhs, '#');
     const token = std.mem.trim(u8, if (hash) |h| rhs[0..h] else rhs, " \t");
     return std.fmt.parseInt(T, token, 10) catch null;
+}
+
+/// Parse a boolean, tolerating a trailing `# comment`. Returns null on anything
+/// that isn't exactly `true` or `false`, so callers keep their default.
+fn parseBool(rhs: []const u8) ?bool {
+    const hash = std.mem.indexOfScalar(u8, rhs, '#');
+    const token = std.mem.trim(u8, if (hash) |h| rhs[0..h] else rhs, " \t");
+    if (std.mem.eql(u8, token, "true")) return true;
+    if (std.mem.eql(u8, token, "false")) return false;
+    return null;
 }
 
 /// Parse a single-line array of double-quoted strings, e.g. `["a.png", "b.png"]`.
@@ -263,6 +291,9 @@ test "defaults returns documented values" {
     try std.testing.expectEqual(@as(u32, 8), cfg.sprite.fps);
     try std.testing.expectEqual(@as(?[]const u32, null), cfg.sprite.tier_fps);
     try std.testing.expectEqual(@as(u32, 32), cfg.sprite.max_frames);
+    try std.testing.expectEqual(true, cfg.sprite.animate);
+    try std.testing.expectEqual(@as(u32, 30), cfg.sprite.max_fps);
+    try std.testing.expectEqual(@as(u32, 5000), cfg.sprite.daemon_ttl_ms);
     try std.testing.expectEqual(@as(?[]const u8, null), cfg.line1.command);
     try std.testing.expectEqual(@as(?u8, null), cfg.line2.color);
     try std.testing.expectEqual(@as(?[]const u8, null), cfg.line3.command);
@@ -291,6 +322,9 @@ test "loadFromToml merges partial overrides over defaults" {
     try std.testing.expectEqual(@as(u32, 8), cfg.sprite.fps);
     try std.testing.expectEqual(@as(?[]const u32, null), cfg.sprite.tier_fps);
     try std.testing.expectEqual(@as(u32, 32), cfg.sprite.max_frames);
+    try std.testing.expectEqual(true, cfg.sprite.animate);
+    try std.testing.expectEqual(@as(u32, 30), cfg.sprite.max_fps);
+    try std.testing.expectEqual(@as(u32, 5000), cfg.sprite.daemon_ttl_ms);
     try std.testing.expectEqual(@as(?[]const u8, null), cfg.line3.command);
 }
 
@@ -344,6 +378,56 @@ test "loadFromToml parses fps, tier_fps and max_frames" {
     try std.testing.expectEqual(@as(u32, 4), cfg.sprite.max_frames);
     const tier_fps = cfg.sprite.tier_fps.?;
     try std.testing.expectEqualSlices(u32, &.{ 8, 8, 10, 12, 16 }, tier_fps);
+}
+
+test "loadFromToml parses animate, max_fps and daemon_ttl_ms overrides" {
+    const toml =
+        \\[sprite]
+        \\animate = false
+        \\max_fps = 60
+        \\daemon_ttl_ms = 2000
+    ;
+    var cfg = try loadFromToml(std.testing.allocator, toml);
+    defer cfg.deinit();
+
+    try std.testing.expectEqual(false, cfg.sprite.animate);
+    try std.testing.expectEqual(@as(u32, 60), cfg.sprite.max_fps);
+    try std.testing.expectEqual(@as(u32, 2000), cfg.sprite.daemon_ttl_ms);
+}
+
+test "loadFromToml parses animate = true" {
+    const toml =
+        \\[sprite]
+        \\animate = true
+    ;
+    var cfg = try loadFromToml(std.testing.allocator, toml);
+    defer cfg.deinit();
+
+    try std.testing.expectEqual(true, cfg.sprite.animate);
+}
+
+test "loadFromToml keeps animate default on a garbage value" {
+    const toml =
+        \\[sprite]
+        \\animate = maybe
+    ;
+    var cfg = try loadFromToml(std.testing.allocator, toml);
+    defer cfg.deinit();
+
+    try std.testing.expectEqual(true, cfg.sprite.animate);
+}
+
+test "loadFromToml defaults animate, max_fps and daemon_ttl_ms when absent" {
+    const toml =
+        \\[sprite]
+        \\fps = 12
+    ;
+    var cfg = try loadFromToml(std.testing.allocator, toml);
+    defer cfg.deinit();
+
+    try std.testing.expectEqual(true, cfg.sprite.animate);
+    try std.testing.expectEqual(@as(u32, 30), cfg.sprite.max_fps);
+    try std.testing.expectEqual(@as(u32, 5000), cfg.sprite.daemon_ttl_ms);
 }
 
 test "loadFromToml skips unparsable tier_fps entries" {
