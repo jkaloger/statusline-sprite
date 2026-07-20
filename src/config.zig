@@ -32,6 +32,15 @@ pub const Line = struct {
 pub const Line2 = struct {
     /// 256-color palette index for the model name. Null means unstyled.
     color: ?u8,
+    /// Ordered list of segment names to render. Null means the hardcoded
+    /// model-only default.
+    segments: ?[]const []const u8 = null,
+    /// Per-segment 256-color palette indices, aligned by position with
+    /// `segments`. A null entry (from `-1` or an out-of-range value) means
+    /// that segment is unstyled.
+    colors: ?[]const ?u8 = null,
+    /// String inserted between rendered segments.
+    separator: ?[]const u8 = null,
 };
 
 pub const Config = struct {
@@ -69,7 +78,7 @@ pub fn defaults() Config {
             .daemon_ttl_ms = 5000,
         },
         .line1 = .{ .command = null },
-        .line2 = .{ .color = null },
+        .line2 = .{ .color = null, .segments = null, .colors = null, .separator = null },
         .line3 = .{ .command = null },
         .arena = null,
     };
@@ -180,6 +189,12 @@ fn applyKey(a: Allocator, cfg: *Config, table: []const u8, key: []const u8, rhs:
     } else if (std.mem.eql(u8, table, "line2")) {
         if (std.mem.eql(u8, key, "color")) {
             if (parseInt(u8, rhs)) |v| cfg.line2.color = v;
+        } else if (std.mem.eql(u8, key, "segments")) {
+            if (try parseStringArray(a, rhs)) |v| cfg.line2.segments = v;
+        } else if (std.mem.eql(u8, key, "separator")) {
+            if (try parseString(a, rhs)) |v| cfg.line2.separator = v;
+        } else if (std.mem.eql(u8, key, "colors")) {
+            if (try parseOptIntArray(u8, a, rhs)) |v| cfg.line2.colors = v;
         }
     } else if (std.mem.eql(u8, table, "line3")) {
         if (std.mem.eql(u8, key, "command")) {
@@ -251,6 +266,48 @@ fn parseIntArray(comptime T: type, a: Allocator, rhs: []const u8) !?[]const T {
     return try list.toOwnedSlice(a);
 }
 
+/// Parse a single-line array of integers where each entry may be `-1` (a
+/// sentinel for "unset"), e.g. `[213, -1, 46]`. Unlike `parseIntArray`, this
+/// preserves position: every comma-separated token yields exactly one result
+/// entry, `null` for `-1` or anything unparsable/out-of-range, so later
+/// entries never get reindexed by a bad one. Returns null on anything that
+/// isn't a `[...]` literal.
+fn parseOptIntArray(comptime T: type, a: Allocator, rhs: []const u8) !?[]const ?T {
+    if (rhs.len == 0 or rhs[0] != '[') return null;
+    const close = std.mem.indexOfScalar(u8, rhs, ']') orelse rhs.len;
+
+    var list: std.ArrayList(?T) = .empty;
+    defer list.deinit(a);
+
+    const inner = rhs[1..close];
+    if (std.mem.trim(u8, inner, " \t").len == 0) return try list.toOwnedSlice(a);
+
+    // Buffer the raw comma-separated tokens first so a trailing comma's
+    // empty tail token can be dropped as punctuation before we decide which
+    // tokens are real (and therefore must each yield exactly one entry).
+    var tokens: std.ArrayList([]const u8) = .empty;
+    defer tokens.deinit(a);
+
+    var it = std.mem.splitScalar(u8, inner, ',');
+    while (it.next()) |entry| try tokens.append(a, entry);
+
+    if (tokens.items.len > 0 and std.mem.trim(u8, tokens.items[tokens.items.len - 1], " \t").len == 0) {
+        _ = tokens.pop();
+    }
+
+    for (tokens.items) |entry| {
+        const token = std.mem.trim(u8, entry, " \t");
+        if (std.mem.eql(u8, token, "-1")) {
+            try list.append(a, null);
+            continue;
+        }
+        const v = std.fmt.parseInt(T, token, 10) catch null;
+        try list.append(a, v);
+    }
+
+    return try list.toOwnedSlice(a);
+}
+
 /// Effective frame rate for a tier: the `tier_fps` entry when present and in
 /// range, else the global `fps`. A zero value passes through (0 = static tier).
 pub fn effectiveFps(cfg: Config, tier_idx: u32) u32 {
@@ -296,6 +353,9 @@ test "defaults returns documented values" {
     try std.testing.expectEqual(@as(u32, 5000), cfg.sprite.daemon_ttl_ms);
     try std.testing.expectEqual(@as(?[]const u8, null), cfg.line1.command);
     try std.testing.expectEqual(@as(?u8, null), cfg.line2.color);
+    try std.testing.expectEqual(@as(?[]const []const u8, null), cfg.line2.segments);
+    try std.testing.expectEqual(@as(?[]const ?u8, null), cfg.line2.colors);
+    try std.testing.expectEqual(@as(?[]const u8, null), cfg.line2.separator);
     try std.testing.expectEqual(@as(?[]const u8, null), cfg.line3.command);
 }
 
@@ -348,6 +408,93 @@ test "loadFromToml ignores out-of-range line2 color" {
     defer cfg.deinit();
 
     try std.testing.expectEqual(@as(?u8, null), cfg.line2.color);
+}
+
+test "loadFromToml parses line2 segments" {
+    const toml =
+        \\[line2]
+        \\segments = ["model", "context", "cost"]
+    ;
+    var cfg = try loadFromToml(std.testing.allocator, toml);
+    defer cfg.deinit();
+
+    const segments = cfg.line2.segments.?;
+    try std.testing.expectEqual(@as(usize, 3), segments.len);
+    try std.testing.expectEqualStrings("model", segments[0]);
+    try std.testing.expectEqualStrings("context", segments[1]);
+    try std.testing.expectEqualStrings("cost", segments[2]);
+}
+
+test "loadFromToml parses line2 separator" {
+    const toml =
+        \\[line2]
+        \\separator = " | "
+    ;
+    var cfg = try loadFromToml(std.testing.allocator, toml);
+    defer cfg.deinit();
+
+    try std.testing.expectEqualStrings(" | ", cfg.line2.separator.?);
+}
+
+test "loadFromToml parses line2 colors preserving position with -1 as null" {
+    const toml =
+        \\[line2]
+        \\colors = [213, -1, 46]
+    ;
+    var cfg = try loadFromToml(std.testing.allocator, toml);
+    defer cfg.deinit();
+
+    const colors = cfg.line2.colors.?;
+    try std.testing.expectEqualSlices(?u8, &.{ 213, null, 46 }, colors);
+}
+
+test "loadFromToml turns an out-of-range line2 colors entry into null without dropping it" {
+    const toml =
+        \\[line2]
+        \\colors = [213, 999, 46]
+    ;
+    var cfg = try loadFromToml(std.testing.allocator, toml);
+    defer cfg.deinit();
+
+    const colors = cfg.line2.colors.?;
+    try std.testing.expectEqualSlices(?u8, &.{ 213, null, 46 }, colors);
+}
+
+test "loadFromToml parses an empty line2 colors array as length zero" {
+    const toml =
+        \\[line2]
+        \\colors = []
+    ;
+    var cfg = try loadFromToml(std.testing.allocator, toml);
+    defer cfg.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), cfg.line2.colors.?.len);
+}
+
+test "loadFromToml drops the phantom entry from a trailing comma in line2 colors" {
+    const toml =
+        \\[line2]
+        \\colors = [213, -1, 46,]
+    ;
+    var cfg = try loadFromToml(std.testing.allocator, toml);
+    defer cfg.deinit();
+
+    const colors = cfg.line2.colors.?;
+    try std.testing.expectEqualSlices(?u8, &.{ 213, null, 46 }, colors);
+}
+
+test "loadFromToml leaves line2 segments, colors and separator null when absent" {
+    const toml =
+        \\[line2]
+        \\color = 213
+    ;
+    var cfg = try loadFromToml(std.testing.allocator, toml);
+    defer cfg.deinit();
+
+    try std.testing.expectEqual(@as(?u8, 213), cfg.line2.color);
+    try std.testing.expectEqual(@as(?[]const []const u8, null), cfg.line2.segments);
+    try std.testing.expectEqual(@as(?[]const ?u8, null), cfg.line2.colors);
+    try std.testing.expectEqual(@as(?[]const u8, null), cfg.line2.separator);
 }
 
 test "loadFromToml parses a faces array" {

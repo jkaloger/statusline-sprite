@@ -18,7 +18,10 @@ daemon_ttl_ms = 5000           # daemon exits this long after refreshes stop
 command = "STARSHIP_SHELL= starship prompt"
 
 [line2]
-color = 213
+color = 213                                   # colors the model segment (also used when segments is unset)
+segments = ["model", "context", "cost"]       # render order; unknown names ignored; unset defaults to model only
+colors = [213, -1, 46]                        # per-position palette index, aligned with segments; -1 = unstyled
+separator = "  "                              # string inserted between rendered segments (default: two spaces)
 
 [line3]
 command = "date '+%H:%M'"

@@ -23,7 +23,40 @@ just demo
 
 ## Configure
 
-Copy `config.example.toml` to `~/.config/statusline-sprite/config.toml` and point `sprite.dir` at a directory of tiered sprite PNGs. Each `[lineN]` section sets a shell command or color for that statusline row.
+Copy `config.example.toml` to `~/.config/statusline-sprite/config.toml` and point `sprite.dir` at a directory of tiered sprite PNGs. `[line1]`/`[line3]` set a shell command for that row; `[line2]` is a configurable strip of segments (see below).
+
+### Line2 segments
+
+`[line2]` renders an ordered, toggle-able strip instead of a single hardcoded model name:
+
+```toml
+[line2]
+segments = ["model", "context", "cost"]  # render order; unset defaults to model only
+colors = [213, -1, 46]                   # per-position 256-color index; -1 = unstyled
+separator = "  "                         # between segments (default: two spaces)
+```
+
+`colors` is matched by position to `segments`. `color` (the pre-existing top-level key) still colors the `model` segment whenever its position has no explicit `colors` entry — including the unset-`segments` default, so an existing `color`-only config keeps working unchanged. Unknown segment names are silently ignored, same as anywhere else in this project's config parsing. A segment hides itself when its underlying data is absent (e.g. `cost` before any turn has run).
+
+Segment catalogue, `name` — source field(s) — rendered format:
+
+- `model` — `model.display_name` — model name verbatim, e.g. `Opus 4.8`
+- `context` — `context_window.used_percentage` / `total_input_tokens` / `context_window_size` — `45% (12.3k/200k)`; degrades to just the percentage or just the counts if only one half is present; hidden if both are missing
+- `cost` — `cost.total_cost_usd` — `$1.42`
+- `session_limit` — `rate_limits.five_hour.used_percentage` — `5h 23%`
+- `weekly_limit` — `rate_limits.seven_day.used_percentage` — `7d 61%`
+- `lines` — `cost.total_lines_added` / `total_lines_removed` — `+42/-7`; hidden unless both are present
+- `duration` — `cost.total_duration_ms` — `45s`, `12m`, or `1h03m`
+- `effort` — `effort.level` — verbatim, e.g. `high`
+- `style` — `output_style.name` — verbatim; hidden when unset or `"default"`
+- `version` — `version` — verbatim, e.g. `1.2.3`
+- `fast` — `fast_mode` — literal `fast` when true; hidden otherwise
+- `thinking` — `thinking.enabled` — literal `think` when true; hidden otherwise
+- `vim` — `vim.mode` — verbatim, e.g. `NORMAL`
+- `pr` — `pr.number` / `pr.review_state` — `PR#123 (approved)`, or `PR#123` without a review state
+- `agent` — `agent.name` — verbatim, e.g. `reviewer`
+
+`session_limit` and `weekly_limit` need Claude Code to have sent `rate_limits` at all: they're absent for API-key sessions, and absent early in a Claude.ai Pro/Max session until the first response comes back. Both segments simply stay hidden until then.
 
 ## Sprites
 

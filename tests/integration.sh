@@ -333,6 +333,35 @@ sleep 0.6
 [ "$(count_pat "$TTY11" 'a=t')" = "$C11" ] || fail "case 11: a daemon is transmitting despite fps=0"
 echo "  ok: fps=0 rendered static frame 0, spawned no daemon"
 
+echo "== case 12: segments = [model, context, cost] renders all three in order =="
+mkdir -p "$WORK/xdg12/statusline-sprite"
+cat > "$WORK/xdg12/statusline-sprite/config.toml" <<EOF
+[line2]
+segments = ["model", "context", "cost"]
+EOF
+SEGMENTS_JSON='{"session_id":"abc-123","cwd":"/tmp","model":{"id":"claude-opus-4","display_name":"Opus 4.8"},"context_window":{"total_input_tokens":120000,"used_percentage":60,"context_window_size":200000},"cost":{"total_cost_usd":1.42}}'
+printf '%s' "$SEGMENTS_JSON" | run_binary HOME="$WORK/home12" XDG_CONFIG_HOME="$WORK/xdg12" > "$WORK/out12" || fail "case 12: non-zero exit ($?)"
+assert_three_lines "$WORK/out12" "case 12"
+L2_12="$(sed -n '2p' "$WORK/out12")"
+echo "$L2_12" | grep -Eq "Opus 4\.8.*[0-9]+%.*\\\$[0-9]+\.[0-9]{2}" || fail "case 12: line 2 ('$L2_12') does not show model, then NN%, then \$N.NN in order"
+echo "  ok: line 2 shows model, percentage, and cost in order"
+
+echo "== case 13: rate-limit segment absent from line when JSON has no rate_limits =="
+mkdir -p "$WORK/xdg13/statusline-sprite"
+cat > "$WORK/xdg13/statusline-sprite/config.toml" <<EOF
+[line2]
+segments = ["model", "session_limit"]
+EOF
+printf '%s' "$SAMPLE_JSON" | run_binary HOME="$WORK/home13" XDG_CONFIG_HOME="$WORK/xdg13" > "$WORK/out13" || fail "case 13: non-zero exit ($?)"
+assert_three_lines "$WORK/out13" "case 13"
+L2_13="$(sed -n '2p' "$WORK/out13")"
+[ "$L2_13" = "$MODEL_NAME" ] || fail "case 13: line 2 ('$L2_13') expected to be exactly '$MODEL_NAME' with the hidden session_limit segment dropped cleanly"
+case "$L2_13" in
+    *"5h"*) fail "case 13: line 2 ('$L2_13') unexpectedly contains '5h' with no rate_limits in the JSON" ;;
+    *) : ;;
+esac
+echo "  ok: session_limit segment absent, line 2 is exactly the model name with no stray separator"
+
 echo "== teardown: reap any daemons; none should remain =="
 # Every animated run above was reaped inline (manifest removed -> daemon exits);
 # a final sweep guards against a straggler, and WORK removal on EXIT covers any

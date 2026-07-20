@@ -8,6 +8,7 @@ const frames = @import("frames.zig");
 const state = @import("state.zig");
 const anim = @import("anim.zig");
 const daemon = @import("daemon.zig");
+const line2 = @import("line2.zig");
 
 const Io = std.Io;
 
@@ -97,10 +98,7 @@ pub fn main(init: std.process.Init) !void {
 
     const l1 = if (cfg.line1.command) |c| rows.runCommand(gpa, io, c, 1000) else try gpa.dupe(u8, "");
     defer gpa.free(l1);
-    const l2 = if (cfg.line2.color) |c|
-        try std.fmt.allocPrint(gpa, "\x1b[38;5;{d}m{s}\x1b[0m", .{ c, sl.model_display_name })
-    else
-        try gpa.dupe(u8, sl.model_display_name);
+    const l2 = try line2.renderLine2(gpa, cfg.line2, sl);
     defer gpa.free(l2);
     const l3 = if (cfg.line3.command) |c| rows.runCommand(gpa, io, c, 1000) else try gpa.dupe(u8, "");
     defer gpa.free(l3);
@@ -543,6 +541,7 @@ test {
     _ = @import("state.zig");
     _ = @import("anim.zig");
     _ = @import("daemon.zig");
+    _ = @import("line2.zig");
 }
 
 test "gapMs: fps 0 means static and yields 0" {
